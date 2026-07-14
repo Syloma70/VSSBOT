@@ -1,0 +1,1 @@
+# Yalnızca Python standart kütüphanesi kullanılır.
