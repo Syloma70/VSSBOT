@@ -82,6 +82,7 @@ class VssBotTests(unittest.TestCase):
             self.assertIn("Motor: 2 kez", send.call_args.args[1])
             app.apply_command(self.message("/etkinlikhesap"))
             self.assertIn("A — 2 kutu", send.call_args.args[1])
+            self.assertIn("\n   • Motor", send.call_args.args[1])
 
     def test_duplicate_event_is_ignored(self):
         event = {"external_id": "same", "occurred_at": "2026-07-16 01:00:00", "account": "A", "reward": "Motor"}

@@ -148,7 +148,9 @@ def split_text(text: str, limit: int = 4000) -> list[str]:
     parts = []
     remaining = text or ""
     while len(remaining) > limit:
-        cut = remaining.rfind("\n", 0, limit + 1)
+        cut = remaining.rfind("\n\n", 0, limit + 1)
+        if cut <= 0:
+            cut = remaining.rfind("\n", 0, limit + 1)
         if cut <= 0:
             cut = limit
         parts.append(remaining[:cut].rstrip())
@@ -203,12 +205,13 @@ def event_report(days: int | None = None, by_account: bool = False) -> str:
         "👤 HESAP BAZLI ETKİNLİK LİSTESİ", period,
         f"📦 {len(rows)} kutu • 👥 {len(accounts)} hesap",
     ]
-    for account, rewards in sorted(accounts.items(), key=lambda item: item[0].casefold()):
-        details = " • ".join(
-            reward + (f" ×{count}" if count > 1 else "")
-            for reward, count in sorted(rewards.items(), key=lambda item: (-item[1], item[0].casefold()))
-        )
-        lines.append(f"\n• {account} — {sum(rewards.values())} kutu\n  {details}")
+    ordered_accounts = sorted(accounts.items(), key=lambda item: item[0].casefold())
+    for index, (account, rewards) in enumerate(ordered_accounts, start=1):
+        lines.append(f"\n{index}. {account} — {sum(rewards.values())} kutu")
+        for reward, count in sorted(
+            rewards.items(), key=lambda item: (-item[1], item[0].casefold())
+        ):
+            lines.append(f"   • {reward}" + (f" ×{count}" if count > 1 else ""))
     return "\n".join(lines)
 
 
