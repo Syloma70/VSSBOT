@@ -71,6 +71,28 @@ class VssBotTests(unittest.TestCase):
             app.apply_command(message)
             self.assertEqual(app.get_setting("mode"), "off")
 
+    def test_event_commands_show_totals_and_accounts(self):
+        app.save_events([
+            {"external_id": "1", "occurred_at": "2026-07-16 01:00:00", "account": "A", "reward": "Motor"},
+            {"external_id": "2", "occurred_at": "2026-07-16 02:00:00", "account": "B", "reward": "Motor"},
+            {"external_id": "3", "occurred_at": "2026-07-16 03:00:00", "account": "A", "reward": "Tank"},
+        ])
+        with patch.object(app, "send_message") as send:
+            app.apply_command(self.message("/etkinlik"))
+            self.assertIn("Motor: 2 kez", send.call_args.args[1])
+            app.apply_command(self.message("/etkinlikhesap"))
+            self.assertIn("A — 2 kutu", send.call_args.args[1])
+
+    def test_duplicate_event_is_ignored(self):
+        event = {"external_id": "same", "occurred_at": "2026-07-16 01:00:00", "account": "A", "reward": "Motor"}
+        self.assertEqual(app.save_events([event]), 1)
+        self.assertEqual(app.save_events([event]), 0)
+
+    def test_long_messages_are_split(self):
+        parts = app.split_text(("x" * 2000 + "\n") * 3)
+        self.assertGreaterEqual(len(parts), 2)
+        self.assertTrue(all(len(part) <= 4000 for part in parts))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -9,6 +9,8 @@ Volkan Arslan hesabının Ticarion PC otomasyonuna katılım kararını Telegram
 - `/surekli`: Her PC otomasyon turuna katıl.
 - `/iptal`: Tek seferlik ve sürekli bütün çalışma izinlerini kapat.
 - `/durum`: Mevcut tercihi göster.
+- `/etkinlik [gün]`: Railway'e aktarılan etkinlik ödüllerinin toplam listesi.
+- `/etkinlikhesap [gün]`: Etkinlik ödüllerinin hesap bazlı listesi.
 - `/yardim`: Kullanım panelini göster.
 
 Komutlar yalnız `VOLKAN_USERNAME` sahibinin ve `ADMIN_USERNAME` yöneticisinin özel
@@ -45,3 +47,6 @@ Authorization: Bearer CONTROL_SECRET
 `once` kararı bu istek sırasında atomik olarak tüketilir. `always`, `/iptal` gelene kadar
 aktif kalır. Salt okunur durum kontrolü `GET /api/status` üzerinden aynı yetkilendirmeyle
 yapılabilir.
+
+PC otomasyonu etkinlik sonuçlarını aynı kimlik doğrulamasıyla `POST /api/events`
+adresine gönderir. Kayıtlar `external_id` ile tekilleştirilir.
