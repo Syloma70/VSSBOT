@@ -5,10 +5,13 @@ from __future__ import annotations
 from contextlib import contextmanager
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import secrets
 import signal
 import sqlite3
 import threading
@@ -106,6 +109,22 @@ def prepare_database() -> None:
             "INSERT OR IGNORE INTO settings(key, value) VALUES('agent_status', '{}')"
         )
         db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('viewer_password_hash', '')"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('skip_requests', '[]')"
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sessions (
+                token_hash TEXT PRIMARY KEY,
+                role TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
             """
             CREATE TABLE IF NOT EXISTS event_rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,6 +171,68 @@ def set_setting(key: str, value: str, db: sqlite3.Connection | None = None) -> N
         return
     with database() as connection:
         connection.execute(query, (key, value))
+
+
+def password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 240_000)
+    return f"{salt.hex()}:{digest.hex()}"
+
+
+def password_matches(password: str, stored: str) -> bool:
+    try:
+        salt_hex, expected = stored.split(":", 1)
+        actual = password_hash(password, bytes.fromhex(salt_hex)).split(":", 1)[1]
+        return hmac.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def save_viewer_password(password: str) -> dict:
+    password = password.strip()
+    if len(password) < 8:
+        raise ValueError("İzleyici şifresi en az 8 karakter olmalı.")
+    set_setting("viewer_password_hash", password_hash(password))
+    with database() as db:
+        db.execute("DELETE FROM sessions WHERE role='viewer'")
+    return {"viewer_password_set": True}
+
+
+def create_session(password: str) -> dict:
+    if CONTROL_SECRET and hmac.compare_digest(password, CONTROL_SECRET):
+        role = "admin"
+    elif password_matches(password, get_setting("viewer_password_hash", "")):
+        role = "viewer"
+    else:
+        raise PermissionError("Şifre geçersiz.")
+    token = secrets.token_urlsafe(32)
+    expires = datetime.now(timezone.utc) + timedelta(days=30)
+    with database() as db:
+        db.execute(
+            "INSERT INTO sessions(token_hash, role, expires_at, created_at) VALUES(?, ?, ?, ?)",
+            (hashlib.sha256(token.encode("utf-8")).hexdigest(), role,
+             expires.isoformat(timespec="seconds"), utc_now()),
+        )
+        db.execute("DELETE FROM sessions WHERE expires_at < ?", (utc_now(),))
+    return {"token": token, "role": role, "expires_at": expires.isoformat(timespec="seconds")}
+
+
+def session_role(token: str) -> str | None:
+    if CONTROL_SECRET and hmac.compare_digest(token, CONTROL_SECRET):
+        return "admin"
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    with database() as db:
+        row = db.execute(
+            "SELECT role, expires_at FROM sessions WHERE token_hash=?", (token_hash,)
+        ).fetchone()
+    if not row:
+        return None
+    try:
+        if datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(timezone.utc):
+            return None
+    except ValueError:
+        return None
+    return str(row["role"])
 
 
 def telegram_request(method: str, fields: dict, timeout: int = 40) -> dict:
@@ -421,6 +502,84 @@ def save_agent_status(payload: dict) -> dict:
     clean["received_at"] = utc_now()
     set_setting("agent_status", json.dumps(clean, ensure_ascii=True, separators=(",", ":")))
     return bot_status_state()
+
+
+def account_status_state() -> dict:
+    bot = bot_status_state()
+    progress = bot.get("progress") or {}
+    names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
+    skipped = {
+        str(value).casefold() for value in progress.get("skipped_accounts", [])
+        if isinstance(value, str)
+    }
+    index = int(progress.get("account_index") or 0)
+    status = str(progress.get("status") or "")
+    accounts = []
+    for position, value in enumerate(names, start=1):
+        name = str(value)
+        if name.casefold() in skipped:
+            state = "skipped"
+        elif status == "completed" or (index > 0 and position < index):
+            state = "completed"
+        elif status == "running" and position == index:
+            state = "running"
+        else:
+            state = "pending"
+        accounts.append({"name": name, "position": position, "status": state})
+    return {
+        "role": None,
+        "bot": bot,
+        "tour_id": str(progress.get("tour_id") or ""),
+        "phase": str(progress.get("phase") or ""),
+        "accounts": accounts,
+        "server_time": utc_now(),
+    }
+
+
+def save_skip_request(account: str, tour_id: str = "") -> dict:
+    account = account.strip()
+    if not account:
+        raise ValueError("Hesap adı gerekli.")
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM settings WHERE key='skip_requests'").fetchone()
+        try:
+            requests = json.loads(str(row[0]) if row else "[]")
+        except json.JSONDecodeError:
+            requests = []
+        requests = [item for item in requests if isinstance(item, dict)]
+        if not any(
+            str(item.get("account", "")).casefold() == account.casefold()
+            and str(item.get("tour_id", "")) == tour_id for item in requests
+        ):
+            requests.append({"account": account, "tour_id": tour_id, "created_at": utc_now()})
+        set_setting("skip_requests", json.dumps(requests[-100:], ensure_ascii=True), db)
+        db.commit()
+    return {"queued": True, "account": account, "tour_id": tour_id}
+
+
+def claim_skip_request(account: str, tour_id: str = "") -> dict:
+    account = account.strip()
+    matched = False
+    with database() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT value FROM settings WHERE key='skip_requests'").fetchone()
+        try:
+            requests = json.loads(str(row[0]) if row else "[]")
+        except json.JSONDecodeError:
+            requests = []
+        remaining = []
+        for item in requests if isinstance(requests, list) else []:
+            same_account = str(item.get("account", "")).casefold() == account.casefold()
+            requested_tour = str(item.get("tour_id", ""))
+            same_tour = not requested_tour or requested_tour == tour_id
+            if not matched and same_account and same_tour:
+                matched = True
+            else:
+                remaining.append(item)
+        set_setting("skip_requests", json.dumps(remaining, ensure_ascii=True), db)
+        db.commit()
+    return {"skip": matched, "account": account, "tour_id": tour_id}
 
 
 def save_earnings(entries: list[dict]) -> int:
@@ -790,13 +949,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def authorized_request(self) -> bool:
+    def authorized_role(self) -> str | None:
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
         else:
             supplied = self.headers.get("X-Control-Secret", "")
-        return bool(CONTROL_SECRET) and supplied == CONTROL_SECRET
+        return session_role(supplied) if supplied else None
+
+    def authorized_request(self, admin: bool = False) -> bool:
+        role = self.authorized_role()
+        return role == "admin" if admin else role in {"admin", "viewer"}
 
     def do_GET(self) -> None:
         if self.path == "/health":
@@ -813,16 +976,33 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
-            self.send_json(200, {"ok": True, **dashboard_state()})
+            role = self.authorized_role()
+            if role == "admin":
+                self.send_json(200, {"ok": True, "role": role, **dashboard_state()})
+            else:
+                accounts = account_status_state()
+                self.send_json(200, {
+                    "ok": True, "role": role, "bot": accounts["bot"],
+                    "accounts": accounts["accounts"], "tour_id": accounts["tour_id"],
+                    "phase": accounts["phase"], "server_time": accounts["server_time"],
+                })
+            return
+        if self.path == "/api/account-status":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            state = account_status_state()
+            state["role"] = self.authorized_role()
+            self.send_json(200, {"ok": True, **state})
             return
         if self.path == "/api/event-control":
-            if not self.authorized_request():
+            if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, **event_control_state()})
             return
         if self.path == "/api/bot-control":
-            if not self.authorized_request():
+            if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, **bot_status_state()})
@@ -836,14 +1016,25 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.send_json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
+        if self.path == "/api/session":
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), 10000)
+                payload = json.loads(self.rfile.read(length) or b"{}")
+                self.send_json(200, {"ok": True, **create_session(str(payload.get("password") or ""))})
+            except PermissionError as error:
+                self.send_json(401, {"ok": False, "error": str(error)})
+            except (ValueError, TypeError, json.JSONDecodeError) as error:
+                self.send_json(400, {"ok": False, "error": str(error)})
+            return
         if self.path not in {
             "/api/claim", "/api/events", "/api/schedule", "/api/mode",
             "/api/event-control",
             "/api/bot-control", "/api/agent-status", "/api/earnings",
+            "/api/viewer-password", "/api/account-skip", "/api/account-skip/claim",
         }:
             self.send_json(404, {"ok": False, "error": "not_found"})
             return
-        if not self.authorized_request():
+        if not self.authorized_request(admin=True):
             self.send_json(401, {"ok": False, "error": "unauthorized"})
             return
         if self.path == "/api/claim":
@@ -852,6 +1043,19 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             length = min(int(self.headers.get("Content-Length", "0")), 1_000_000)
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if self.path == "/api/viewer-password":
+                self.send_json(200, {"ok": True, **save_viewer_password(str(payload.get("password") or ""))})
+                return
+            if self.path == "/api/account-skip":
+                self.send_json(200, {"ok": True, **save_skip_request(
+                    str(payload.get("account") or ""), str(payload.get("tour_id") or "")
+                )})
+                return
+            if self.path == "/api/account-skip/claim":
+                self.send_json(200, {"ok": True, **claim_skip_request(
+                    str(payload.get("account") or ""), str(payload.get("tour_id") or "")
+                )})
+                return
             if self.path == "/api/mode":
                 self.send_json(200, {"ok": True, **save_mode(str(payload.get("mode") or ""))})
                 return

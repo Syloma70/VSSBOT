@@ -156,6 +156,30 @@ class VssBotTests(unittest.TestCase):
         self.assertEqual(status["progress"]["current_account"], "FANDA")
         self.assertEqual(app.save_bot_control(False)["health"], "off")
 
+    def test_viewer_password_creates_view_only_session(self):
+        app.save_viewer_password("guvenli-test-123")
+        session = app.create_session("guvenli-test-123")
+        self.assertEqual(session["role"], "viewer")
+        self.assertEqual(app.session_role(session["token"]), "viewer")
+        self.assertNotIn("guvenli-test-123", app.get_setting("viewer_password_hash"))
+
+    def test_skip_request_is_claimed_once_for_account(self):
+        app.save_skip_request("FANDA", "tur-1")
+        self.assertFalse(app.claim_skip_request("FANDA", "tur-2")["skip"])
+        self.assertTrue(app.claim_skip_request("FANDA", "tur-1")["skip"])
+        self.assertFalse(app.claim_skip_request("FANDA", "tur-1")["skip"])
+
+    def test_account_statuses_are_derived_from_live_progress(self):
+        app.save_agent_status({
+            "health": "running",
+            "progress": {
+                "status": "running", "phase": "normal", "account_index": 2,
+                "account_names": ["A", "B", "C"], "skipped_accounts": ["A"],
+            },
+        })
+        states = app.account_status_state()["accounts"]
+        self.assertEqual([item["status"] for item in states], ["skipped", "running", "pending"])
+
     def test_earnings_daily_and_all_time_reports(self):
         today = datetime.now().strftime("%Y-%m-%d")
         entries = [
