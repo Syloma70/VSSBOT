@@ -19,6 +19,7 @@ import time
 import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -154,6 +155,45 @@ def prepare_database() -> None:
             )
             """
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                role TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT NOT NULL,
+                details TEXT NOT NULL
+            )
+            """
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at)")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS incidents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                kind TEXT NOT NULL,
+                severity TEXT NOT NULL,
+                account TEXT NOT NULL,
+                message TEXT NOT NULL,
+                occurrence_count INTEGER NOT NULL DEFAULT 1,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'open',
+                resolved_at TEXT,
+                resolved_by TEXT NOT NULL DEFAULT '',
+                last_event_key TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        incident_columns = {
+            str(row[1]) for row in db.execute("PRAGMA table_info(incidents)").fetchall()
+        }
+        if "last_event_key" not in incident_columns:
+            db.execute("ALTER TABLE incidents ADD COLUMN last_event_key TEXT NOT NULL DEFAULT ''")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, last_seen)")
         db.execute(
             """
             CREATE TABLE IF NOT EXISTS event_rewards (
@@ -346,6 +386,102 @@ def session_identity(token: str) -> dict | None:
 def session_role(token: str) -> str | None:
     identity = session_identity(token)
     return str(identity["role"]) if identity else None
+
+
+def record_audit(actor: str, role: str, action: str, target: str = "", details: dict | None = None) -> None:
+    with database() as db:
+        db.execute(
+            "INSERT INTO audit_log(created_at, actor, role, action, target, details) VALUES(?, ?, ?, ?, ?, ?)",
+            (utc_now(), actor[:100], role[:20], action[:100], target[:200],
+             json.dumps(details or {}, ensure_ascii=True, separators=(",", ":"))[:4000]),
+        )
+
+
+def audit_entries(limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    with database() as db:
+        rows = db.execute(
+            "SELECT id, created_at, actor, role, action, target, details FROM audit_log ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        try:
+            item["details"] = json.loads(str(item["details"]))
+        except json.JSONDecodeError:
+            item["details"] = {}
+        result.append(item)
+    return result
+
+
+def record_incident(kind: str, severity: str, account: str, message: str, event_key: str) -> None:
+    message = " ".join(str(message).split()).strip()
+    if not message:
+        return
+    account = str(account or "Sistem").strip()[:200]
+    fingerprint = hashlib.sha256(
+        f"{kind.casefold()}|{account.casefold()}|{message.casefold()}".encode("utf-8")
+    ).hexdigest()
+    now = utc_now()
+    with database() as db:
+        row = db.execute(
+            "SELECT occurrence_count, last_event_key FROM incidents WHERE fingerprint=?", (fingerprint,)
+        ).fetchone()
+        if row:
+            count = int(row["occurrence_count"]) + (str(row["last_event_key"]) != event_key)
+            db.execute(
+                """UPDATE incidents SET severity=?, occurrence_count=?, last_seen=?, status='open',
+                   resolved_at=NULL, resolved_by='', last_event_key=? WHERE fingerprint=?""",
+                (severity, count, now, event_key, fingerprint),
+            )
+        else:
+            db.execute(
+                """INSERT INTO incidents(fingerprint, kind, severity, account, message,
+                   occurrence_count, first_seen, last_seen, status, last_event_key)
+                   VALUES(?, ?, ?, ?, ?, 1, ?, ?, 'open', ?)""",
+                (fingerprint, kind, severity, account, message[:2000], now, now, event_key),
+            )
+
+
+def record_incidents_from_agent(payload: dict) -> None:
+    progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+    tour_id = str(progress.get("tour_id") or "")
+    updated = str(progress.get("updated_at") or payload.get("received_at") or utc_now())
+    last_error = str(progress.get("last_error") or "").strip()
+    if last_error:
+        record_incident(
+            "account_error", "warning", str(progress.get("current_account") or "Bilinmeyen hesap"),
+            last_error, f"{tour_id}|{updated}|account_error",
+        )
+    if str(payload.get("health") or "") == "error":
+        message = str(payload.get("message") or "Bot hata durumuna geçti.")
+        record_incident("bot_error", "critical", "Sistem", message, f"{payload.get('last_run')}|{message}")
+
+
+def incident_entries(allowed: list[str] | None = None, limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    with database() as db:
+        rows = db.execute(
+            """SELECT id, kind, severity, account, message, occurrence_count, first_seen,
+               last_seen, status, resolved_at, resolved_by
+               FROM incidents ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, id DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    allowed_keys = None if allowed is None else {value.casefold() for value in allowed}
+    return [dict(row) for row in rows if allowed_keys is None or str(row["account"]).casefold() in allowed_keys]
+
+
+def resolve_incident(incident_id: int, actor: str) -> dict:
+    with database() as db:
+        row = db.execute("SELECT account FROM incidents WHERE id=?", (incident_id,)).fetchone()
+        if not row:
+            raise ValueError("Olay bulunamadı.")
+        db.execute(
+            "UPDATE incidents SET status='resolved', resolved_at=?, resolved_by=? WHERE id=?",
+            (utc_now(), actor[:100], incident_id),
+        )
+    return {"id": incident_id, "status": "resolved", "account": str(row["account"])}
 
 
 def telegram_request(method: str, fields: dict, timeout: int = 40) -> dict:
@@ -614,6 +750,7 @@ def save_agent_status(payload: dict) -> dict:
     clean = {key: payload.get(key) for key in allowed if key in payload}
     clean["received_at"] = utc_now()
     set_setting("agent_status", json.dumps(clean, ensure_ascii=True, separators=(",", ":")))
+    record_incidents_from_agent(clean)
     progress = clean.get("progress") if isinstance(clean.get("progress"), dict) else {}
     names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
     if names:
@@ -712,6 +849,46 @@ def account_status_state(allowed_accounts: list[str] | None = None) -> dict:
         "tour_id": str(progress.get("tour_id") or ""),
         "phase": str(progress.get("phase") or ""),
         "accounts": accounts,
+        "server_time": utc_now(),
+    }
+
+
+def account_detail(account: str) -> dict:
+    account = account.strip()
+    if not account:
+        raise ValueError("Hesap adı gerekli.")
+    today = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+    with database() as db:
+        recent = db.execute(
+            """SELECT occurred_at, operation, result FROM earnings
+               WHERE account=? COLLATE NOCASE ORDER BY id DESC LIMIT 20""",
+            (account,),
+        ).fetchall()
+        daily_count = int(db.execute(
+            "SELECT COUNT(*) FROM earnings WHERE account=? COLLATE NOCASE AND substr(occurred_at,1,10)=?",
+            (account, today),
+        ).fetchone()[0])
+        all_count = int(db.execute(
+            "SELECT COUNT(*) FROM earnings WHERE account=? COLLATE NOCASE", (account,)
+        ).fetchone()[0])
+        rewards = db.execute(
+            """SELECT occurred_at, reward FROM event_rewards
+               WHERE account=? COLLATE NOCASE ORDER BY id DESC LIMIT 10""",
+            (account,),
+        ).fetchall()
+    status_items = account_status_state()["accounts"]
+    live = next(
+        (item for item in status_items if str(item["name"]).casefold() == account.casefold()),
+        {"name": account, "status": "not_scheduled", "position": 0},
+    )
+    return {
+        "account": account,
+        "live": live,
+        "daily_operations": daily_count,
+        "all_time_operations": all_count,
+        "recent": [dict(row) for row in recent],
+        "event_rewards": [dict(row) for row in rewards],
+        "incidents": incident_entries([account], 20),
         "server_time": utc_now(),
     }
 
@@ -1145,18 +1322,28 @@ class ApiHandler(BaseHTTPRequestHandler):
         role = self.authorized_role()
         return role == "admin" if admin else role in {"admin", "viewer"}
 
+    def audit_action(self, action: str, target: str = "", details: dict | None = None) -> None:
+        identity = self.authorized_identity() or {"username": "unknown", "role": "unknown"}
+        record_audit(
+            str(identity.get("username") or "unknown"), str(identity.get("role") or "unknown"),
+            action, target, details,
+        )
+
     def do_GET(self) -> None:
-        if self.path == "/health":
+        parsed = urlsplit(self.path)
+        path = parsed.path
+        query = parse_qs(parsed.query)
+        if path == "/health":
             self.send_json(200, {"ok": True, "service": "vssbot", "time": utc_now()})
             return
-        if self.path == "/api/status":
+        if path == "/api/status":
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             mode = get_setting("mode", "off")
             self.send_json(200, {"ok": True, "mode": mode, "active": mode != "off"})
             return
-        if self.path == "/api/dashboard":
+        if path == "/api/dashboard":
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
@@ -1173,7 +1360,7 @@ class ApiHandler(BaseHTTPRequestHandler):
                     "phase": accounts["phase"], "server_time": accounts["server_time"],
                 })
             return
-        if self.path == "/api/account-status":
+        if path == "/api/account-status":
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
@@ -1185,31 +1372,61 @@ class ApiHandler(BaseHTTPRequestHandler):
             state["username"] = username
             self.send_json(200, {"ok": True, **state})
             return
-        if self.path == "/api/users":
+        if path == "/api/users":
             if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, "users": list_app_users()})
             return
-        if self.path == "/api/account-catalog":
+        if path == "/api/account-catalog":
             if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, "accounts": account_catalog()})
             return
-        if self.path == "/api/event-control":
+        if path == "/api/account-detail":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            account = str((query.get("name") or [""])[0]).strip()
+            identity = self.authorized_identity() or {}
+            if identity.get("role") != "admin" and account.casefold() not in {
+                value.casefold() for value in assigned_accounts(str(identity.get("username") or ""))
+            }:
+                self.send_json(403, {"ok": False, "error": "Bu hesap kullanıcıya atanmamış."})
+                return
+            try:
+                self.send_json(200, {"ok": True, **account_detail(account)})
+            except ValueError as error:
+                self.send_json(400, {"ok": False, "error": str(error)})
+            return
+        if path == "/api/incidents":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            identity = self.authorized_identity() or {}
+            allowed = None if identity.get("role") == "admin" else assigned_accounts(str(identity.get("username") or ""))
+            self.send_json(200, {"ok": True, "incidents": incident_entries(allowed)})
+            return
+        if path == "/api/audit":
+            if not self.authorized_request(admin=True):
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, "entries": audit_entries()})
+            return
+        if path == "/api/event-control":
             if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, **event_control_state()})
             return
-        if self.path == "/api/bot-control":
+        if path == "/api/bot-control":
             if not self.authorized_request(admin=True):
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
             self.send_json(200, {"ok": True, **bot_status_state()})
             return
-        if self.path == "/api/schedule":
+        if path == "/api/schedule":
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
@@ -1222,9 +1439,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 length = min(int(self.headers.get("Content-Length", "0")), 10000)
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                self.send_json(200, {"ok": True, **create_session(
+                result = create_session(
                     str(payload.get("username") or ""), str(payload.get("password") or "")
-                )})
+                )
+                record_audit(result["username"], result["role"], "login", "android")
+                self.send_json(200, {"ok": True, **result})
             except PermissionError as error:
                 self.send_json(401, {"ok": False, "error": str(error)})
             except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -1235,6 +1454,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             "/api/event-control",
             "/api/bot-control", "/api/agent-status", "/api/earnings",
             "/api/users", "/api/users/delete", "/api/account-skip", "/api/account-skip/claim",
+            "/api/incidents/resolve",
         }:
             self.send_json(404, {"ok": False, "error": "not_found"})
             return
@@ -1249,20 +1469,31 @@ class ApiHandler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length) or b"{}")
             if self.path == "/api/users":
                 accounts = payload.get("accounts") or []
-                self.send_json(200, {"ok": True, **save_app_user(
+                result = save_app_user(
                     str(payload.get("username") or ""),
                     str(payload.get("password") or ""), accounts,
-                )})
+                )
+                self.audit_action("user_saved", result["username"], {"accounts": result["accounts"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/users/delete":
-                self.send_json(200, {"ok": True, **delete_app_user(
+                result = delete_app_user(
                     str(payload.get("username") or "")
-                )})
+                )
+                self.audit_action("user_deleted", result["username"], {"deleted": result["deleted"]})
+                self.send_json(200, {"ok": True, **result})
+                return
+            if self.path == "/api/incidents/resolve":
+                result = resolve_incident(int(payload.get("id") or 0), str((self.authorized_identity() or {}).get("username") or "admin"))
+                self.audit_action("incident_resolved", result["account"], {"incident_id": result["id"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/account-skip":
-                self.send_json(200, {"ok": True, **save_skip_request(
+                result = save_skip_request(
                     str(payload.get("account") or ""), str(payload.get("tour_id") or "")
-                )})
+                )
+                self.audit_action("account_skip_queued", result["account"], {"tour_id": result["tour_id"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/account-skip/claim":
                 self.send_json(200, {"ok": True, **claim_skip_request(
@@ -1270,17 +1501,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 )})
                 return
             if self.path == "/api/mode":
-                self.send_json(200, {"ok": True, **save_mode(str(payload.get("mode") or ""))})
+                result = save_mode(str(payload.get("mode") or ""))
+                self.audit_action("mode_changed", "bot", {"mode": result["mode"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/event-control":
                 if not isinstance(payload.get("enabled"), bool):
                     raise ValueError("enabled must be boolean")
-                self.send_json(200, {"ok": True, **save_event_control(payload["enabled"])})
+                result = save_event_control(payload["enabled"])
+                self.audit_action("event_control_changed", "event", {"enabled": result["enabled"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/bot-control":
                 if not isinstance(payload.get("enabled"), bool):
                     raise ValueError("enabled must be boolean")
-                self.send_json(200, {"ok": True, **save_bot_control(payload["enabled"])})
+                result = save_bot_control(payload["enabled"])
+                self.audit_action("bot_control_changed", "bot", {"enabled": result["enabled"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             if self.path == "/api/agent-status":
                 if not isinstance(payload, dict):
@@ -1308,7 +1545,9 @@ class ApiHandler(BaseHTTPRequestHandler):
                     ):
                         raise ValueError("hours must be a list of integers from 0 to 23")
                     times = [f"{hour:02d}:00" for hour in hours]
-                self.send_json(200, {"ok": True, **save_schedule(enabled, times)})
+                result = save_schedule(enabled, times)
+                self.audit_action("schedule_changed", "schedule", {"enabled": enabled, "times": result["times"]})
+                self.send_json(200, {"ok": True, **result})
                 return
             events = payload.get("events") or []
             if not isinstance(events, list):

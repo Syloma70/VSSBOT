@@ -199,6 +199,35 @@ class VssBotTests(unittest.TestCase):
         self.assertEqual(filtered["bot"]["progress"]["account_names"], ["B"])
         self.assertEqual(app.account_catalog(), ["A", "B", "C"])
 
+    def test_agent_error_creates_deduplicated_incident_and_can_be_resolved(self):
+        payload = {
+            "health": "running",
+            "progress": {
+                "tour_id": "tur-1", "updated_at": "2026-07-20T01:00:00",
+                "current_account": "FANDA", "last_error": "CAPTCHA açılamadı",
+            },
+        }
+        app.save_agent_status(payload)
+        app.save_agent_status(payload)
+        incidents = app.incident_entries(["FANDA"])
+        self.assertEqual(len(incidents), 1)
+        self.assertEqual(incidents[0]["occurrence_count"], 1)
+        resolved = app.resolve_incident(incidents[0]["id"], "admin")
+        self.assertEqual(resolved["status"], "resolved")
+
+    def test_audit_and_account_detail(self):
+        app.record_audit("admin", "admin", "account_skip_queued", "FANDA", {"tour_id": "x"})
+        self.assertEqual(app.audit_entries()[0]["action"], "account_skip_queued")
+        today = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+        app.save_earnings([{
+            "external_id": "detail-1", "occurred_at": today + " 01:00:00",
+            "account": "FANDA", "operation": "Uzay Farmı", "result": "2 aurorium",
+        }])
+        detail = app.account_detail("FANDA")
+        self.assertEqual(detail["daily_operations"], 1)
+        self.assertEqual(detail["all_time_operations"], 1)
+        self.assertEqual(detail["recent"][0]["operation"], "Uzay Farmı")
+
     def test_earnings_daily_and_all_time_reports(self):
         today = datetime.now().strftime("%Y-%m-%d")
         entries = [
