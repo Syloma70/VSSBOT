@@ -196,6 +196,21 @@ def prepare_database() -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_incidents_status ON incidents(status, last_seen)")
         db.execute(
             """
+            CREATE TABLE IF NOT EXISTS account_timeline (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_key TEXT NOT NULL UNIQUE,
+                occurred_at TEXT NOT NULL,
+                account TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                severity TEXT NOT NULL DEFAULT 'info'
+            )
+            """
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_timeline_account ON account_timeline(account, occurred_at)")
+        db.execute(
+            """
             CREATE TABLE IF NOT EXISTS event_rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 external_id TEXT NOT NULL UNIQUE,
@@ -415,6 +430,62 @@ def audit_entries(limit: int = 100) -> list[dict]:
     return result
 
 
+def record_timeline(event_key: str, occurred_at: str, account: str, kind: str,
+                    title: str, detail: str = "", severity: str = "info",
+                    db: sqlite3.Connection | None = None) -> None:
+    values = (
+        str(event_key)[:500], str(occurred_at or utc_now())[:100],
+        str(account or "Sistem").strip()[:200], str(kind)[:50],
+        str(title).strip()[:500], str(detail).strip()[:2000], str(severity)[:20],
+    )
+    query = """INSERT OR IGNORE INTO account_timeline
+               (event_key, occurred_at, account, kind, title, detail, severity)
+               VALUES(?, ?, ?, ?, ?, ?, ?)"""
+    if db is not None:
+        db.execute(query, values)
+    else:
+        with database() as connection:
+            connection.execute(query, values)
+
+
+def record_timeline_from_agent(payload: dict) -> None:
+    progress = payload.get("progress") if isinstance(payload.get("progress"), dict) else {}
+    account = str(progress.get("current_account") or "").strip()
+    if not account:
+        return
+    tour_id = str(progress.get("tour_id") or "")
+    updated = str(progress.get("updated_at") or payload.get("received_at") or utc_now())
+    status = str(progress.get("status") or payload.get("task_state") or "").strip()
+    action = str(progress.get("last_action") or "").strip()
+    error = str(progress.get("last_error") or "").strip()
+    signature = hashlib.sha256(f"{tour_id}|{account}|{status}|{action}|{error}".encode("utf-8")).hexdigest()
+    if error:
+        title, detail, severity, kind = "Hata oluştu", error, "warning", "error"
+    elif action:
+        title, detail, severity, kind = action, status, "info", "activity"
+    else:
+        title, detail, severity, kind = "Hesap işleniyor", status, "info", "activity"
+    record_timeline(f"agent:{signature}", updated, account, kind, title, detail, severity)
+
+
+def timeline_entries(allowed: list[str] | None = None, account: str = "", limit: int = 100) -> list[dict]:
+    limit = max(1, min(int(limit), 500))
+    with database() as db:
+        if account:
+            rows = db.execute(
+                """SELECT id, occurred_at, account, kind, title, detail, severity
+                   FROM account_timeline WHERE account=? COLLATE NOCASE
+                   ORDER BY occurred_at DESC, id DESC LIMIT ?""", (account, limit),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT id, occurred_at, account, kind, title, detail, severity
+                   FROM account_timeline ORDER BY occurred_at DESC, id DESC LIMIT ?""", (limit,),
+            ).fetchall()
+    allowed_keys = None if allowed is None else {str(value).casefold() for value in allowed}
+    return [dict(row) for row in rows if allowed_keys is None or str(row["account"]).casefold() in allowed_keys]
+
+
 def record_incident(kind: str, severity: str, account: str, message: str, event_key: str) -> None:
     message = " ".join(str(message).split()).strip()
     if not message:
@@ -469,7 +540,21 @@ def incident_entries(allowed: list[str] | None = None, limit: int = 100) -> list
             (limit,),
         ).fetchall()
     allowed_keys = None if allowed is None else {value.casefold() for value in allowed}
-    return [dict(row) for row in rows if allowed_keys is None or str(row["account"]).casefold() in allowed_keys]
+    result = []
+    for row in rows:
+        if allowed_keys is not None and str(row["account"]).casefold() not in allowed_keys:
+            continue
+        item = dict(row)
+        count = int(item["occurrence_count"])
+        item["alert_level"] = "critical" if count >= 3 or item["severity"] == "critical" else "warning"
+        milestone = 3 if count >= 3 else 1 if count == 1 else 0
+        item["alert_milestone"] = milestone
+        item["should_notify"] = item["status"] == "open" and milestone > 0
+        item["notification_reason"] = (
+            "İlk hata" if count == 1 else "Hata 3 kez tekrarlandı" if count >= 3 else "Tekrar alarmı susturuldu"
+        )
+        result.append(item)
+    return result
 
 
 def resolve_incident(incident_id: int, actor: str) -> dict:
@@ -751,6 +836,7 @@ def save_agent_status(payload: dict) -> dict:
     clean["received_at"] = utc_now()
     set_setting("agent_status", json.dumps(clean, ensure_ascii=True, separators=(",", ":")))
     record_incidents_from_agent(clean)
+    record_timeline_from_agent(clean)
     progress = clean.get("progress") if isinstance(clean.get("progress"), dict) else {}
     names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
     if names:
@@ -889,6 +975,76 @@ def account_detail(account: str) -> dict:
         "recent": [dict(row) for row in recent],
         "event_rewards": [dict(row) for row in rewards],
         "incidents": incident_entries([account], 20),
+        "health": account_health(account),
+        "timeline": timeline_entries([account], account, 30),
+        "server_time": utc_now(),
+    }
+
+
+def account_health(account: str) -> dict:
+    account = account.strip()
+    score = 100
+    reasons = []
+    with database() as db:
+        open_rows = db.execute(
+            """SELECT severity, occurrence_count FROM incidents
+               WHERE account=? COLLATE NOCASE AND status='open'""", (account,),
+        ).fetchall()
+        last_row = db.execute(
+            "SELECT occurred_at FROM earnings WHERE account=? COLLATE NOCASE ORDER BY id DESC LIMIT 1",
+            (account,),
+        ).fetchone()
+    for row in open_rows:
+        count = int(row["occurrence_count"])
+        score -= 30 if str(row["severity"]) == "critical" or count >= 3 else 15
+    if open_rows:
+        reasons.append(f"{len(open_rows)} açık hata")
+    last_operation = str(last_row[0]) if last_row else ""
+    if last_operation:
+        try:
+            parsed = datetime.fromisoformat(last_operation.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone(timedelta(hours=3)))
+            age_hours = (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds() / 3600
+            if age_hours > 48:
+                score -= 25
+                reasons.append("48 saattir başarılı işlem yok")
+            elif age_hours > 24:
+                score -= 15
+                reasons.append("24 saattir başarılı işlem yok")
+        except ValueError:
+            pass
+    else:
+        score -= 10
+        reasons.append("Henüz işlem kaydı yok")
+    state = next((item["status"] for item in account_status_state()["accounts"]
+                  if str(item["name"]).casefold() == account.casefold()), "not_scheduled")
+    if state == "skipped":
+        score -= 10
+        reasons.append("Bu tur atlandı")
+    if bot_status_state()["health"] in {"offline", "error"}:
+        score -= 25
+        reasons.append("Bot bağlantısı sağlıksız")
+    score = max(0, min(100, score))
+    level = "healthy" if score >= 80 else "risk" if score >= 50 else "critical"
+    return {"score": score, "level": level, "reasons": reasons or ["Sorun görünmüyor"],
+            "last_operation": last_operation, "open_incidents": len(open_rows)}
+
+
+def operations_state(allowed: list[str] | None = None) -> dict:
+    names = account_catalog() if allowed is None else allowed
+    health = [{"account": name, **account_health(name)} for name in names]
+    health.sort(key=lambda item: (int(item["score"]), str(item["account"]).casefold()))
+    incidents = incident_entries(allowed, 100)
+    return {
+        "health": health,
+        "timeline": timeline_entries(allowed, limit=100),
+        "alarms": {
+            "open": sum(item["status"] == "open" for item in incidents),
+            "critical": sum(item["status"] == "open" and item["alert_level"] == "critical" for item in incidents),
+            "notify_now": sum(bool(item["should_notify"]) for item in incidents),
+        },
+        "alert_incidents": [item for item in incidents if item["should_notify"]][:20],
         "server_time": utc_now(),
     }
 
@@ -959,7 +1115,13 @@ def save_earnings(entries: list[dict]) -> int:
                     operation[:200], result[:2000], utc_now(),
                 ),
             )
-            saved += int(cursor.rowcount > 0)
+            inserted = cursor.rowcount > 0
+            saved += int(inserted)
+            if inserted:
+                record_timeline(
+                    f"earning:{external_id}", occurred_at, account, "success",
+                    operation, result, "success", db,
+                )
     return saved
 
 
@@ -1399,6 +1561,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self.send_json(200, {"ok": True, **account_detail(account)})
             except ValueError as error:
                 self.send_json(400, {"ok": False, "error": str(error)})
+            return
+        if path == "/api/operations":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            identity = self.authorized_identity() or {}
+            allowed = None if identity.get("role") == "admin" else assigned_accounts(str(identity.get("username") or ""))
+            self.send_json(200, {"ok": True, **operations_state(allowed)})
             return
         if path == "/api/incidents":
             if not self.authorized_request():

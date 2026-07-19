@@ -228,6 +228,29 @@ class VssBotTests(unittest.TestCase):
         self.assertEqual(detail["all_time_operations"], 1)
         self.assertEqual(detail["recent"][0]["operation"], "Uzay Farmı")
 
+    def test_health_score_escalates_repeated_errors_and_smart_alarm(self):
+        for number in range(1, 4):
+            app.record_incident("account_error", "warning", "FANDA", "CAPTCHA error", f"event-{number}")
+        incident = app.incident_entries(["FANDA"])[0]
+        self.assertEqual(incident["occurrence_count"], 3)
+        self.assertEqual(incident["alert_level"], "critical")
+        self.assertTrue(incident["should_notify"])
+        health = app.account_health("FANDA")
+        self.assertEqual(health["level"], "critical")
+        self.assertLess(health["score"], 50)
+
+    def test_timeline_deduplicates_agent_state_and_scopes_operations(self):
+        payload = {
+            "health": "running", "task_state": "Running",
+            "progress": {"tour_id": "tur-7", "current_account": "FANDA", "status": "running", "last_action": "Uzay farm"},
+        }
+        app.save_agent_status(payload)
+        app.save_agent_status(payload)
+        self.assertEqual(len(app.timeline_entries(["FANDA"])), 1)
+        state = app.operations_state(["FANDA"])
+        self.assertEqual([item["account"] for item in state["health"]], ["FANDA"])
+        self.assertEqual(state["timeline"][0]["account"], "FANDA")
+
     def test_earnings_daily_and_all_time_reports(self):
         today = datetime.now().strftime("%Y-%m-%d")
         entries = [
