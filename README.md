@@ -9,8 +9,13 @@ Volkan Arslan hesabının Ticarion PC otomasyonuna katılım kararını Telegram
 - `/surekli`: Her PC otomasyon turuna katıl.
 - `/iptal`: Tek seferlik ve sürekli bütün çalışma izinlerini kapat.
 - `/durum`: Mevcut tercihi göster.
+- `/saat 02 08 14 20`: Global otomatik turu yalnız seçilen Türkiye saatlerinde çalıştır.
+- `/saat her`: Global otomatik turu her saat başına döndür.
+- `/saat kapat`: Global otomatik turları durdur.
+- `/saatler`: Geçerli global saat planını göster.
 - `/etkinlik [gün]`: Railway'e aktarılan etkinlik ödüllerinin toplam listesi.
 - `/etkinlikhesap [gün]`: Etkinlik ödüllerinin hesap bazlı listesi.
+- `/etkinlikac`, `/etkinlikkapat`, `/etkinlikdurum`: Etkinlik kodunu silmeden açar, kapatır ve durumunu gösterir.
 - `/yardim`: Kullanım panelini göster.
 
 Komutlar yalnız `VOLKAN_USERNAME` sahibinin ve `ADMIN_USERNAME` yöneticisinin özel
@@ -18,6 +23,9 @@ sohbetinden kabul edilir. Varsayılan yönetici `@JackTheRipppper` hesabıdır. 
 eşleşmede iki hesabın Telegram kullanıcı kimliği ayrı ayrı kaydedilir ve sonraki komutlarda
 kimlik doğrulanır. Her iki yetkili de hesabı açabilir, sürekli moda alabilir, kapatabilir ve
 durumunu görebilir.
+
+Global saat planını yalnız `ADMIN_USERNAME` değiştirebilir. Her iki yetkili `/saatler` ile
+planı görebilir. Saatler `Europe/Istanbul` (Türkiye) saat dilimindedir.
 
 ## Railway kurulumu
 
@@ -50,3 +58,11 @@ yapılabilir.
 
 PC otomasyonu etkinlik sonuçlarını aynı kimlik doğrulamasıyla `POST /api/events`
 adresine gönderir. Kayıtlar `external_id` ile tekilleştirilir.
+
+Saat planı `GET /api/schedule` ile okunur ve `POST /api/schedule` ile güncellenir. POST
+gövdesi örneği: `{"enabled":true,"hours":[2,8,14,20]}`. Boş `hours` listesi her saat
+anlamına gelir.
+
+Android kontrol paneli `GET /api/dashboard`, `POST /api/mode` ve
+`GET/POST /api/event-control` uçlarını kullanır. Tüm uçlar aynı Bearer yetkilendirmesini
+zorunlu tutar. Etkinlik modülü ilk kurulumda kapalıdır; kod ve eski ödül kayıtları korunur.

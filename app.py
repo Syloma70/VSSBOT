@@ -76,6 +76,15 @@ def prepare_database() -> None:
             "INSERT OR IGNORE INTO settings(key, value) VALUES('telegram_offset', '0')"
         )
         db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('schedule_enabled', '1')"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('schedule_hours', '')"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('event_enabled', '0')"
+        )
+        db.execute(
             """
             CREATE TABLE IF NOT EXISTS event_rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -136,9 +145,18 @@ HELP_TEXT = (
     "<code>/iptal</code> — Tek seferlik isteği ve sürekli modu kapatır.\n\n"
     "📊 <b>Durumu öğren</b>\n"
     "<code>/durum</code> — Kayıtlı çalışma tercihini gösterir.\n\n"
+    "🕐 <b>Otomatik tur saatleri (yalnız yönetici)</b>\n"
+    "<code>/saat 02 08 14 20</code> — Yalnız seçilen saatlerde çalıştırır.\n"
+    "<code>/saat her</code> — Her saat çalıştırır.\n"
+    "<code>/saat kapat</code> — Otomatik turları kapatır.\n"
+    "<code>/saatler</code> — Geçerli saat planını gösterir.\n\n"
     "🎁 <b>Etkinlik raporları</b>\n"
     "<code>/etkinlik [gün]</code> — Çıkan ödüllerin toplam listesi.\n"
     "<code>/etkinlikhesap [gün]</code> — Hesap bazlı ödül listesi.\n\n"
+    "🎛 <b>Etkinlik kontrolü</b>\n"
+    "<code>/etkinlikac</code> — Etkinlik kontrollerini açar.\n"
+    "<code>/etkinlikkapat</code> — Kodu silmeden etkinliği kapatır.\n"
+    "<code>/etkinlikdurum</code> — Etkinlik anahtarını gösterir.\n\n"
     "⚠️ Oyuna kendin gireceğin zaman çift giriş yaşamamak için önce "
     "<code>/iptal</code> gönder."
 )
@@ -255,6 +273,97 @@ def mode_text(mode: str) -> str:
     }.get(mode, "⛔ Otomatik çalışma kapalı.")
 
 
+def schedule_state() -> dict:
+    enabled = get_setting("schedule_enabled", "1") == "1"
+    raw_hours = get_setting("schedule_hours", "")
+    try:
+        hours = sorted({int(value) for value in raw_hours.split(",") if value != ""})
+    except ValueError:
+        hours = []
+    hours = [hour for hour in hours if 0 <= hour <= 23]
+    return {"enabled": enabled, "hours": hours, "timezone": "Europe/Istanbul"}
+
+
+def schedule_text() -> str:
+    state = schedule_state()
+    if not state["enabled"]:
+        plan = "KAPALI"
+    elif not state["hours"]:
+        plan = "Her saat başı"
+    else:
+        plan = ", ".join(f"{hour:02d}:00" for hour in state["hours"])
+    return f"🕐 <b>Otomatik tur planı</b>\n\n{plan}\nSaat dilimi: Türkiye"
+
+
+def event_control_state() -> dict:
+    return {"enabled": get_setting("event_enabled", "0") == "1"}
+
+
+def save_event_control(enabled: bool) -> dict:
+    set_setting("event_enabled", "1" if enabled else "0")
+    return event_control_state()
+
+
+def dashboard_state() -> dict:
+    mode = get_setting("mode", "off")
+    with database() as db:
+        event_count = int(db.execute("SELECT COUNT(*) FROM event_rewards").fetchone()[0])
+        account_count = int(
+            db.execute("SELECT COUNT(DISTINCT account) FROM event_rewards").fetchone()[0]
+        )
+        last_event = db.execute(
+            "SELECT occurred_at, account, reward FROM event_rewards ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    return {
+        "mode": mode,
+        "active": mode != "off",
+        "schedule": schedule_state(),
+        "event": {
+            **event_control_state(),
+            "reward_count": event_count,
+            "account_count": account_count,
+            "last_reward": dict(last_event) if last_event else None,
+        },
+        "server_time": utc_now(),
+    }
+
+
+def save_mode(mode: str) -> dict:
+    if mode not in {"off", "once", "always"}:
+        raise ValueError("mode must be off, once or always")
+    set_setting("mode", mode)
+    return {"mode": mode, "active": mode != "off"}
+
+
+def parse_schedule_command(command_text: str) -> tuple[bool, list[int]]:
+    args = command_text.strip().split()[1:]
+    if not args:
+        raise ValueError("Kullanım: /saat 02 08 14 20, /saat her veya /saat kapat")
+    normalized = " ".join(args).casefold()
+    if normalized in {"kapat", "kapalı", "kapali", "off"}:
+        return False, []
+    if normalized in {"her", "hepsi", "saatlik", "ac", "aç", "on"}:
+        return True, []
+    values = [part for part in normalized.replace(",", " ").split() if part]
+    hours: set[int] = set()
+    for value in values:
+        hour_text = value.split(":", 1)[0]
+        if not hour_text.isdigit() or not 0 <= int(hour_text) <= 23:
+            raise ValueError(f"Geçersiz saat: {value}. Saatler 0 ile 23 arasında olmalı.")
+        hours.add(int(hour_text))
+    if not hours:
+        raise ValueError("En az bir saat yazmalısın.")
+    return True, sorted(hours)
+
+
+def save_schedule(enabled: bool, hours: list[int]) -> dict:
+    clean_hours = sorted({int(hour) for hour in hours if 0 <= int(hour) <= 23})
+    with database() as db:
+        set_setting("schedule_enabled", "1" if enabled else "0", db)
+        set_setting("schedule_hours", ",".join(map(str, clean_hours)), db)
+    return schedule_state()
+
+
 def apply_command(message: dict) -> None:
     role = authorized_role(message)
     if not role:
@@ -289,10 +398,31 @@ def apply_command(message: dict) -> None:
         )
     elif command == "/durum":
         response = f"📊 <b>Volkan Arslan otomasyon durumu</b>\n\n{mode_text(current_mode)}"
+    elif command == "/saatler":
+        response = schedule_text()
+    elif command == "/saat":
+        if role != "admin":
+            response = "⛔ Otomatik tur saatlerini yalnız yönetici değiştirebilir."
+        else:
+            try:
+                enabled, hours = parse_schedule_command(command_text)
+                save_schedule(enabled, hours)
+                response = "✅ Saat planı kaydedildi.\n\n" + schedule_text()
+            except ValueError as error:
+                response = f"❌ {error}"
     elif command == "/etkinlik":
         response = event_report(command_days(command_text))
     elif command == "/etkinlikhesap":
         response = event_report(command_days(command_text), by_account=True)
+    elif command in {"/etkinlikac", "/etkinlikaç"}:
+        save_event_control(True)
+        response = "🎁 <b>Etkinlik modülü açıldı.</b>\n\nSonraki turda etkinlik kutuları kontrol edilecek."
+    elif command == "/etkinlikkapat":
+        save_event_control(False)
+        response = "⏸ <b>Etkinlik modülü kapatıldı.</b>\n\nKod ve geçmiş kayıtlar korunuyor."
+    elif command == "/etkinlikdurum":
+        durum = "AÇIK" if event_control_state()["enabled"] else "KAPALI"
+        response = f"🎁 <b>Etkinlik modülü:</b> {durum}"
     elif command.startswith("/"):
         response = "❓ Bu komutu tanımıyorum. Kullanılabilir komutlar için /yardim yaz."
     if not response:
@@ -417,10 +547,31 @@ class ApiHandler(BaseHTTPRequestHandler):
             mode = get_setting("mode", "off")
             self.send_json(200, {"ok": True, "mode": mode, "active": mode != "off"})
             return
+        if self.path == "/api/dashboard":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, **dashboard_state()})
+            return
+        if self.path == "/api/event-control":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, **event_control_state()})
+            return
+        if self.path == "/api/schedule":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, **schedule_state()})
+            return
         self.send_json(404, {"ok": False, "error": "not_found"})
 
     def do_POST(self) -> None:
-        if self.path not in {"/api/claim", "/api/events"}:
+        if self.path not in {
+            "/api/claim", "/api/events", "/api/schedule", "/api/mode",
+            "/api/event-control",
+        }:
             self.send_json(404, {"ok": False, "error": "not_found"})
             return
         if not self.authorized_request():
@@ -432,6 +583,24 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             length = min(int(self.headers.get("Content-Length", "0")), 1_000_000)
             payload = json.loads(self.rfile.read(length) or b"{}")
+            if self.path == "/api/mode":
+                self.send_json(200, {"ok": True, **save_mode(str(payload.get("mode") or ""))})
+                return
+            if self.path == "/api/event-control":
+                if not isinstance(payload.get("enabled"), bool):
+                    raise ValueError("enabled must be boolean")
+                self.send_json(200, {"ok": True, **save_event_control(payload["enabled"])})
+                return
+            if self.path == "/api/schedule":
+                enabled = bool(payload.get("enabled", True))
+                hours = payload.get("hours", [])
+                if not isinstance(hours, list) or any(
+                    isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23
+                    for hour in hours
+                ):
+                    raise ValueError("hours must be a list of integers from 0 to 23")
+                self.send_json(200, {"ok": True, **save_schedule(enabled, hours)})
+                return
             events = payload.get("events") or []
             if not isinstance(events, list):
                 raise ValueError("events must be a list")

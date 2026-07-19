@@ -71,6 +71,33 @@ class VssBotTests(unittest.TestCase):
             app.apply_command(message)
             self.assertEqual(app.get_setting("mode"), "off")
 
+    def test_admin_can_set_global_schedule_hours(self):
+        message = self.message("/saat 02 08:00, 14 20")
+        message["chat"]["username"] = "JackTheRipppper"
+        message["from"]["username"] = "JackTheRipppper"
+        message["chat"]["id"] = 456
+        message["from"]["id"] = 456
+        with patch.object(app, "send_message") as send:
+            app.apply_command(message)
+        self.assertEqual(app.schedule_state()["hours"], [2, 8, 14, 20])
+        self.assertTrue(app.schedule_state()["enabled"])
+        self.assertIn("02:00", send.call_args.args[1])
+
+    def test_non_admin_cannot_change_global_schedule(self):
+        with patch.object(app, "send_message"):
+            app.apply_command(self.message("/saat kapat"))
+        self.assertTrue(app.schedule_state()["enabled"])
+
+    def test_schedule_can_be_disabled_and_restored_to_hourly(self):
+        app.save_schedule(False, [])
+        self.assertFalse(app.schedule_state()["enabled"])
+        app.save_schedule(True, [])
+        self.assertEqual(app.schedule_text().splitlines()[2], "Her saat başı")
+
+    def test_invalid_schedule_hour_is_rejected(self):
+        with self.assertRaises(ValueError):
+            app.parse_schedule_command("/saat 24")
+
     def test_event_commands_show_totals_and_accounts(self):
         app.save_events([
             {"external_id": "1", "occurred_at": "2026-07-16 01:00:00", "account": "A", "reward": "Motor"},
@@ -88,6 +115,31 @@ class VssBotTests(unittest.TestCase):
         event = {"external_id": "same", "occurred_at": "2026-07-16 01:00:00", "account": "A", "reward": "Motor"}
         self.assertEqual(app.save_events([event]), 1)
         self.assertEqual(app.save_events([event]), 0)
+
+    def test_event_control_defaults_off_and_can_be_enabled(self):
+        self.assertFalse(app.event_control_state()["enabled"])
+        self.assertTrue(app.save_event_control(True)["enabled"])
+        self.assertTrue(app.event_control_state()["enabled"])
+
+    def test_dashboard_combines_control_states_and_event_totals(self):
+        app.save_mode("always")
+        app.save_schedule(True, [2, 8])
+        app.save_event_control(True)
+        app.save_events([{
+            "external_id": "dashboard-event",
+            "occurred_at": "2026-07-16 01:00:00",
+            "account": "A",
+            "reward": "Motor",
+        }])
+        dashboard = app.dashboard_state()
+        self.assertEqual(dashboard["mode"], "always")
+        self.assertEqual(dashboard["schedule"]["hours"], [2, 8])
+        self.assertTrue(dashboard["event"]["enabled"])
+        self.assertEqual(dashboard["event"]["reward_count"], 1)
+
+    def test_invalid_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            app.save_mode("danger")
 
     def test_long_messages_are_split(self):
         parts = app.split_text(("x" * 2000 + "\n") * 3)
