@@ -8,10 +8,12 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import sqlite3
 import threading
 import time
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -469,6 +471,93 @@ def earnings_summary(today_only: bool) -> dict:
     }
 
 
+MATERIAL_NAMES = {
+    "xp": "XP", "kereste": "Kereste", "demir": "Demir", "celik": "Çelik",
+    "plastik": "Plastik", "petrol": "Petrol", "tas": "Taş", "cam": "Cam",
+    "anakart": "Anakart", "motor": "Motor", "enerji": "Enerji",
+    "sanayi parcasi": "Sanayi Parçası", "mermi": "Mermi", "belge": "Belge",
+    "uranyum": "Uranyum", "aurorium": "Aurorium", "photonium": "Photonium",
+    "voidium": "Voidium", "carbon": "Carbon",
+}
+
+
+def material_key(value: str) -> str:
+    value = str(value or "").replace("ı", "i").replace("İ", "I")
+    value = "".join(
+        char for char in unicodedata.normalize("NFKD", value)
+        if not unicodedata.combining(char)
+    ).casefold()
+    return re.sub(r"\s+", " ", re.sub(r"[_-]+", " ", value)).strip()
+
+
+def integer_value(value: str) -> int:
+    return int(re.sub(r"\D", "", str(value or "")) or "0")
+
+
+def earning_materials(operation: str, result: str) -> dict[str, int]:
+    materials: dict[str, int] = defaultdict(int)
+    for amount, raw_name in re.findall(
+        r"([\d.,]+)\s+adet\s+([\wÇĞİÖŞÜçğıöşü_-]+)", result or "", re.IGNORECASE
+    ):
+        key = material_key(raw_name)
+        if key == "urun":
+            operation_key = material_key(operation)
+            if operation_key == "eyalet fabrikasi":
+                key = "enerji"
+            elif operation_key == "eyalet sanayisi":
+                key = "sanayi parcasi"
+        materials[key] += integer_value(amount)
+    for raw_name, amount in re.findall(
+        r"Kazanılan\s+([^:!-]+?)\s*:\s*([\d.,]+)", result or "", re.IGNORECASE
+    ):
+        key = material_key(raw_name)
+        if key not in {"bonus exp", "exp", "xp"}:
+            materials[key] += integer_value(amount)
+    for after, before in re.findall(
+        r"(?:Bonus\s+)?(?:Exp|XP)\s*:\s*([\d.,]+)|([\d.,]+)\s*(?:Exp|XP)\b",
+        result or "", re.IGNORECASE,
+    ):
+        materials["xp"] += integer_value(after or before)
+    return {key: amount for key, amount in materials.items() if key and amount > 0}
+
+
+def material_reports() -> dict:
+    turkey_now = datetime.now(timezone(timedelta(hours=3)))
+    today = turkey_now.date().isoformat()
+    yesterday = (turkey_now.date() - timedelta(days=1)).isoformat()
+    periods: dict[str, dict[str, int]] = {
+        "today": defaultdict(int), "yesterday": defaultdict(int), "all_time": defaultdict(int)
+    }
+    with database() as db:
+        rows = db.execute("SELECT occurred_at, operation, result FROM earnings").fetchall()
+    for row in rows:
+        date = str(row["occurred_at"])[:10]
+        for key, amount in earning_materials(row["operation"], row["result"]).items():
+            periods["all_time"][key] += amount
+            if date == today:
+                periods["today"][key] += amount
+            elif date == yesterday:
+                periods["yesterday"][key] += amount
+    comparison = []
+    keys = set(periods["today"]) | set(periods["yesterday"])
+    for key in sorted(
+        keys, key=lambda item: max(periods["today"][item], periods["yesterday"][item]),
+        reverse=True,
+    ):
+        current, previous = periods["today"][key], periods["yesterday"][key]
+        percent = None if previous == 0 else round(((current - previous) / previous) * 100, 1)
+        comparison.append({
+            "key": key, "name": MATERIAL_NAMES.get(key, key.title()),
+            "today": current, "yesterday": previous, "difference": current - previous,
+            "percent": percent,
+        })
+    all_time = [
+        {"key": key, "name": MATERIAL_NAMES.get(key, key.title()), "amount": amount}
+        for key, amount in sorted(periods["all_time"].items(), key=lambda item: item[1], reverse=True)
+    ]
+    return {"today": today, "yesterday": yesterday, "comparison": comparison, "all_time": all_time}
+
+
 def earnings_dashboard() -> dict:
     with database() as db:
         recent = db.execute(
@@ -477,6 +566,7 @@ def earnings_dashboard() -> dict:
     return {
         "daily": earnings_summary(True),
         "all_time": earnings_summary(False),
+        "materials": material_reports(),
         "recent": [dict(row) for row in recent],
     }
 

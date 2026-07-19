@@ -1,5 +1,5 @@
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -165,6 +165,26 @@ class VssBotTests(unittest.TestCase):
         reports = app.earnings_dashboard()
         self.assertEqual(reports["daily"]["total"], 1)
         self.assertEqual(reports["all_time"]["total"], 2)
+
+    def test_material_report_parses_products_and_compares_with_yesterday(self):
+        turkey_today = datetime.now(timezone(timedelta(hours=3))).date()
+        today = turkey_today.isoformat()
+        yesterday = (turkey_today - timedelta(days=1)).isoformat()
+        app.save_earnings([
+            {"external_id": "m1", "occurred_at": today + " 01:00:00", "account": "A", "operation": "Uzay Farmı", "result": "30 adet aurorium | 4 adet carbon | 30 XP"},
+            {"external_id": "m2", "occurred_at": today + " 02:00:00", "account": "A", "operation": "Enerji fabrikası", "result": "Kazanılan Enerji : 14 - Kazanılan Bonus Exp : 20000"},
+            {"external_id": "m3", "occurred_at": yesterday + " 02:00:00", "account": "A", "operation": "Enerji fabrikası", "result": "Kazanılan Enerji : 7 - Kazanılan Bonus Exp : 10000"},
+            {"external_id": "m4", "occurred_at": today + " 03:00:00", "account": "A", "operation": "Eyalet sanayisi", "result": "18 adet ürün deponuza aktarıldı."},
+        ])
+        report = app.earnings_dashboard()["materials"]
+        by_key = {item["key"]: item for item in report["comparison"]}
+        self.assertEqual(by_key["enerji"]["today"], 14)
+        self.assertEqual(by_key["enerji"]["yesterday"], 7)
+        self.assertEqual(by_key["enerji"]["percent"], 100.0)
+        self.assertEqual(by_key["sanayi parcasi"]["today"], 18)
+        self.assertEqual(by_key["aurorium"]["today"], 30)
+        self.assertEqual(by_key["xp"]["today"], 20030)
+        self.assertNotIn("bonus exp", by_key)
 
     def test_schedule_accepts_minute_and_dot_formats(self):
         enabled, times = app.parse_schedule_command("/saat 04.16 08:05 14")
