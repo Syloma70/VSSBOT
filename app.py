@@ -526,9 +526,13 @@ def account_status_state() -> dict:
         else:
             state = "pending"
         accounts.append({"name": name, "position": position, "status": state})
+    public_progress = dict(progress)
+    public_progress.pop("completed_accounts", None)
+    public_bot = dict(bot)
+    public_bot["progress"] = public_progress
     return {
         "role": None,
-        "bot": bot,
+        "bot": public_bot,
         "tour_id": str(progress.get("tour_id") or ""),
         "phase": str(progress.get("phase") or ""),
         "accounts": accounts,
