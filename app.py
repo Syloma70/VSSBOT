@@ -115,12 +115,42 @@ def prepare_database() -> None:
             "INSERT OR IGNORE INTO settings(key, value) VALUES('skip_requests', '[]')"
         )
         db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('account_catalog', '[]')"
+        )
+        db.execute(
             """
             CREATE TABLE IF NOT EXISTS sessions (
                 token_hash TEXT PRIMARY KEY,
                 role TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
                 expires_at TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        session_columns = {
+            str(row[1]) for row in db.execute("PRAGMA table_info(sessions)").fetchall()
+        }
+        if "username" not in session_columns:
+            db.execute("ALTER TABLE sessions ADD COLUMN username TEXT NOT NULL DEFAULT ''")
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS app_user_accounts (
+                username TEXT NOT NULL,
+                account_name TEXT NOT NULL,
+                PRIMARY KEY(username, account_name),
+                FOREIGN KEY(username) REFERENCES app_users(username) ON DELETE CASCADE
             )
             """
         )
@@ -188,42 +218,120 @@ def password_matches(password: str, stored: str) -> bool:
         return False
 
 
-def save_viewer_password(password: str) -> dict:
-    password = password.strip()
-    if len(password) < 8:
-        raise ValueError("İzleyici şifresi en az 8 karakter olmalı.")
-    set_setting("viewer_password_hash", password_hash(password))
+def normalize_app_username(username: str) -> str:
+    username = username.strip().casefold()
+    if not re.fullmatch(r"[a-z0-9_.-]{3,32}", username):
+        raise ValueError("Kullanıcı adı 3-32 karakter olmalı; harf, rakam, nokta, alt çizgi ve tire kullanılabilir.")
+    return username
+
+
+def save_app_user(username: str, password: str, accounts: list[str]) -> dict:
+    username = normalize_app_username(username)
+    if not isinstance(accounts, list):
+        raise ValueError("Hesap listesi geçersiz.")
+    clean_accounts = []
+    seen = set()
+    for value in accounts:
+        account = str(value).strip()
+        key = account.casefold()
+        if account and key not in seen:
+            seen.add(key)
+            clean_accounts.append(account[:200])
     with database() as db:
-        db.execute("DELETE FROM sessions WHERE role='viewer'")
-    return {"viewer_password_set": True}
+        row = db.execute("SELECT password_hash FROM app_users WHERE username=?", (username,)).fetchone()
+        if not row and len(password) < 8:
+            raise ValueError("Yeni kullanıcı şifresi en az 8 karakter olmalı.")
+        if row and password and len(password) < 8:
+            raise ValueError("Yeni şifre en az 8 karakter olmalı.")
+        hashed = password_hash(password) if password else str(row[0])
+        now = utc_now()
+        db.execute(
+            """INSERT INTO app_users(username, password_hash, active, created_at, updated_at)
+               VALUES(?, ?, 1, ?, ?)
+               ON CONFLICT(username) DO UPDATE SET
+                   password_hash=excluded.password_hash, active=1, updated_at=excluded.updated_at""",
+            (username, hashed, now, now),
+        )
+        db.execute("DELETE FROM app_user_accounts WHERE username=?", (username,))
+        db.executemany(
+            "INSERT INTO app_user_accounts(username, account_name) VALUES(?, ?)",
+            [(username, account) for account in clean_accounts],
+        )
+        db.execute("DELETE FROM sessions WHERE username=?", (username,))
+    return {"username": username, "accounts": clean_accounts, "active": True}
 
 
-def create_session(password: str) -> dict:
-    if CONTROL_SECRET and hmac.compare_digest(password, CONTROL_SECRET):
+def list_app_users() -> list[dict]:
+    with database() as db:
+        rows = db.execute(
+            "SELECT username, active, created_at, updated_at FROM app_users ORDER BY username"
+        ).fetchall()
+        assignments = db.execute(
+            "SELECT username, account_name FROM app_user_accounts ORDER BY username, account_name"
+        ).fetchall()
+    by_user: dict[str, list[str]] = defaultdict(list)
+    for row in assignments:
+        by_user[str(row["username"])].append(str(row["account_name"]))
+    return [
+        {"username": str(row["username"]), "active": bool(row["active"]),
+         "accounts": by_user[str(row["username"])], "created_at": row["created_at"],
+         "updated_at": row["updated_at"]}
+        for row in rows
+    ]
+
+
+def delete_app_user(username: str) -> dict:
+    username = normalize_app_username(username)
+    with database() as db:
+        db.execute("DELETE FROM app_user_accounts WHERE username=?", (username,))
+        deleted = db.execute("DELETE FROM app_users WHERE username=?", (username,)).rowcount > 0
+        db.execute("DELETE FROM sessions WHERE username=?", (username,))
+    return {"username": username, "deleted": deleted}
+
+
+def assigned_accounts(username: str) -> list[str]:
+    with database() as db:
+        rows = db.execute(
+            "SELECT account_name FROM app_user_accounts WHERE username=? ORDER BY account_name",
+            (username,),
+        ).fetchall()
+    return [str(row[0]) for row in rows]
+
+
+def create_session(username: str, password: str) -> dict:
+    supplied_username = username.strip().casefold()
+    if CONTROL_SECRET and hmac.compare_digest(password, CONTROL_SECRET) and supplied_username in {"", "admin", "yonetici"}:
         role = "admin"
-    elif password_matches(password, get_setting("viewer_password_hash", "")):
-        role = "viewer"
+        supplied_username = "admin"
     else:
-        raise PermissionError("Şifre geçersiz.")
+        supplied_username = normalize_app_username(supplied_username)
+        with database() as db:
+            row = db.execute(
+                "SELECT password_hash, active FROM app_users WHERE username=?", (supplied_username,)
+            ).fetchone()
+        if not row or not bool(row["active"]) or not password_matches(password, str(row["password_hash"])):
+            raise PermissionError("Kullanıcı adı veya şifre geçersiz.")
+        role = "viewer"
     token = secrets.token_urlsafe(32)
     expires = datetime.now(timezone.utc) + timedelta(days=30)
     with database() as db:
         db.execute(
-            "INSERT INTO sessions(token_hash, role, expires_at, created_at) VALUES(?, ?, ?, ?)",
-            (hashlib.sha256(token.encode("utf-8")).hexdigest(), role,
+            "INSERT INTO sessions(token_hash, role, username, expires_at, created_at) VALUES(?, ?, ?, ?, ?)",
+            (hashlib.sha256(token.encode("utf-8")).hexdigest(), role, supplied_username,
              expires.isoformat(timespec="seconds"), utc_now()),
         )
         db.execute("DELETE FROM sessions WHERE expires_at < ?", (utc_now(),))
-    return {"token": token, "role": role, "expires_at": expires.isoformat(timespec="seconds")}
+    return {"token": token, "role": role, "username": supplied_username,
+            "expires_at": expires.isoformat(timespec="seconds")}
 
 
-def session_role(token: str) -> str | None:
+def session_identity(token: str) -> dict | None:
     if CONTROL_SECRET and hmac.compare_digest(token, CONTROL_SECRET):
-        return "admin"
+        return {"role": "admin", "username": "admin"}
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with database() as db:
         row = db.execute(
-            "SELECT role, expires_at FROM sessions WHERE token_hash=?", (token_hash,)
+            "SELECT role, username, expires_at FROM sessions WHERE token_hash=?", (token_hash,)
         ).fetchone()
     if not row:
         return None
@@ -232,7 +340,12 @@ def session_role(token: str) -> str | None:
             return None
     except ValueError:
         return None
-    return str(row["role"])
+    return {"role": str(row["role"]), "username": str(row["username"] or "")}
+
+
+def session_role(token: str) -> str | None:
+    identity = session_identity(token)
+    return str(identity["role"]) if identity else None
 
 
 def telegram_request(method: str, fields: dict, timeout: int = 40) -> dict:
@@ -501,13 +614,48 @@ def save_agent_status(payload: dict) -> dict:
     clean = {key: payload.get(key) for key in allowed if key in payload}
     clean["received_at"] = utc_now()
     set_setting("agent_status", json.dumps(clean, ensure_ascii=True, separators=(",", ":")))
+    progress = clean.get("progress") if isinstance(clean.get("progress"), dict) else {}
+    names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
+    if names:
+        existing = account_catalog()
+        by_key = {value.casefold(): value for value in existing}
+        for value in names:
+            name = str(value).strip()
+            if name:
+                by_key.setdefault(name.casefold(), name[:200])
+        set_setting("account_catalog", json.dumps(list(by_key.values()), ensure_ascii=True))
     return bot_status_state()
 
 
-def account_status_state() -> dict:
+def account_catalog() -> list[str]:
+    try:
+        stored = json.loads(get_setting("account_catalog", "[]"))
+    except json.JSONDecodeError:
+        stored = []
+    values = [str(value).strip() for value in stored if str(value).strip()] if isinstance(stored, list) else []
+    with database() as db:
+        rows = db.execute(
+            "SELECT DISTINCT account FROM earnings UNION SELECT DISTINCT account FROM event_rewards"
+        ).fetchall()
+    by_key = {value.casefold(): value for value in values}
+    for row in rows:
+        value = str(row[0] or "").strip()
+        if value:
+            by_key.setdefault(value.casefold(), value)
+    return sorted(by_key.values(), key=str.casefold)
+
+
+def account_status_state(allowed_accounts: list[str] | None = None) -> dict:
     bot = bot_status_state()
     progress = bot.get("progress") or {}
-    names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
+    all_names = progress.get("account_names") if isinstance(progress.get("account_names"), list) else []
+    allowed_by_key = None if allowed_accounts is None else {
+        str(value).casefold(): str(value) for value in allowed_accounts
+    }
+    indexed_names = [
+        (position, value) for position, value in enumerate(all_names, start=1)
+        if allowed_by_key is None or str(value).casefold() in allowed_by_key
+    ]
     skipped = {
         str(value).casefold() for value in progress.get("skipped_accounts", [])
         if isinstance(value, str)
@@ -515,19 +663,47 @@ def account_status_state() -> dict:
     index = int(progress.get("account_index") or 0)
     status = str(progress.get("status") or "")
     accounts = []
-    for position, value in enumerate(names, start=1):
+    for original_position, value in indexed_names:
         name = str(value)
         if name.casefold() in skipped:
             state = "skipped"
-        elif status == "completed" or (index > 0 and position < index):
+        elif status == "completed" or (index > 0 and original_position < index):
             state = "completed"
-        elif status == "running" and position == index:
+        elif status == "running" and original_position == index:
             state = "running"
         else:
             state = "pending"
-        accounts.append({"name": name, "position": position, "status": state})
+        accounts.append({"name": name, "position": len(accounts) + 1, "status": state})
+    if allowed_by_key is not None:
+        present = {str(item["name"]).casefold() for item in accounts}
+        for account in allowed_accounts or []:
+            if str(account).casefold() not in present:
+                accounts.append({
+                    "name": str(account), "position": len(accounts) + 1,
+                    "status": "not_scheduled",
+                })
     public_progress = dict(progress)
     public_progress.pop("completed_accounts", None)
+    public_progress["account_names"] = [str(value) for _, value in indexed_names]
+    public_progress["skipped_accounts"] = [
+        str(item["name"]) for item in accounts if item["status"] == "skipped"
+    ]
+    public_progress["completed_count"] = sum(
+        1 for item in accounts if item["status"] in {"completed", "skipped"}
+    )
+    current_account = str(public_progress.get("current_account") or "")
+    if allowed_by_key is not None:
+        public_progress["total_accounts"] = len(accounts)
+        visible_index = next(
+            (position for position, item in enumerate(accounts, start=1)
+             if str(item["name"]).casefold() == current_account.casefold()),
+            0,
+        )
+        public_progress["account_index"] = visible_index
+        if not visible_index:
+            public_progress["current_account"] = ""
+            public_progress["last_action"] = ""
+            public_progress["last_error"] = ""
     public_bot = dict(bot)
     public_bot["progress"] = public_progress
     return {
@@ -953,13 +1129,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def authorized_role(self) -> str | None:
+    def authorized_identity(self) -> dict | None:
         supplied = self.headers.get("Authorization", "")
         if supplied.startswith("Bearer "):
             supplied = supplied[7:]
         else:
             supplied = self.headers.get("X-Control-Secret", "")
-        return session_role(supplied) if supplied else None
+        return session_identity(supplied) if supplied else None
+
+    def authorized_role(self) -> str | None:
+        identity = self.authorized_identity()
+        return str(identity["role"]) if identity else None
 
     def authorized_request(self, admin: bool = False) -> bool:
         role = self.authorized_role()
@@ -984,9 +1164,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             if role == "admin":
                 self.send_json(200, {"ok": True, "role": role, **dashboard_state()})
             else:
-                accounts = account_status_state()
+                identity = self.authorized_identity() or {}
+                username = str(identity.get("username") or "")
+                accounts = account_status_state(assigned_accounts(username))
                 self.send_json(200, {
-                    "ok": True, "role": role, "bot": accounts["bot"],
+                    "ok": True, "role": role, "username": username, "bot": accounts["bot"],
                     "accounts": accounts["accounts"], "tour_id": accounts["tour_id"],
                     "phase": accounts["phase"], "server_time": accounts["server_time"],
                 })
@@ -995,9 +1177,25 @@ class ApiHandler(BaseHTTPRequestHandler):
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
                 return
-            state = account_status_state()
-            state["role"] = self.authorized_role()
+            identity = self.authorized_identity() or {}
+            role = str(identity.get("role") or "")
+            username = str(identity.get("username") or "")
+            state = account_status_state(None if role == "admin" else assigned_accounts(username))
+            state["role"] = role
+            state["username"] = username
             self.send_json(200, {"ok": True, **state})
+            return
+        if self.path == "/api/users":
+            if not self.authorized_request(admin=True):
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, "users": list_app_users()})
+            return
+        if self.path == "/api/account-catalog":
+            if not self.authorized_request(admin=True):
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, "accounts": account_catalog()})
             return
         if self.path == "/api/event-control":
             if not self.authorized_request(admin=True):
@@ -1024,7 +1222,9 @@ class ApiHandler(BaseHTTPRequestHandler):
             try:
                 length = min(int(self.headers.get("Content-Length", "0")), 10000)
                 payload = json.loads(self.rfile.read(length) or b"{}")
-                self.send_json(200, {"ok": True, **create_session(str(payload.get("password") or ""))})
+                self.send_json(200, {"ok": True, **create_session(
+                    str(payload.get("username") or ""), str(payload.get("password") or "")
+                )})
             except PermissionError as error:
                 self.send_json(401, {"ok": False, "error": str(error)})
             except (ValueError, TypeError, json.JSONDecodeError) as error:
@@ -1034,7 +1234,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             "/api/claim", "/api/events", "/api/schedule", "/api/mode",
             "/api/event-control",
             "/api/bot-control", "/api/agent-status", "/api/earnings",
-            "/api/viewer-password", "/api/account-skip", "/api/account-skip/claim",
+            "/api/users", "/api/users/delete", "/api/account-skip", "/api/account-skip/claim",
         }:
             self.send_json(404, {"ok": False, "error": "not_found"})
             return
@@ -1047,8 +1247,17 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             length = min(int(self.headers.get("Content-Length", "0")), 1_000_000)
             payload = json.loads(self.rfile.read(length) or b"{}")
-            if self.path == "/api/viewer-password":
-                self.send_json(200, {"ok": True, **save_viewer_password(str(payload.get("password") or ""))})
+            if self.path == "/api/users":
+                accounts = payload.get("accounts") or []
+                self.send_json(200, {"ok": True, **save_app_user(
+                    str(payload.get("username") or ""),
+                    str(payload.get("password") or ""), accounts,
+                )})
+                return
+            if self.path == "/api/users/delete":
+                self.send_json(200, {"ok": True, **delete_app_user(
+                    str(payload.get("username") or "")
+                )})
                 return
             if self.path == "/api/account-skip":
                 self.send_json(200, {"ok": True, **save_skip_request(

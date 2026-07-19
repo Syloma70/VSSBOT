@@ -156,12 +156,25 @@ class VssBotTests(unittest.TestCase):
         self.assertEqual(status["progress"]["current_account"], "FANDA")
         self.assertEqual(app.save_bot_control(False)["health"], "off")
 
-    def test_viewer_password_creates_view_only_session(self):
-        app.save_viewer_password("guvenli-test-123")
-        session = app.create_session("guvenli-test-123")
+    def test_named_viewer_sees_only_assigned_accounts(self):
+        saved = app.save_app_user("ali", "guvenli-test-123", ["YAVUZ", "FANDA"])
+        self.assertEqual(saved["username"], "ali")
+        session = app.create_session("ali", "guvenli-test-123")
         self.assertEqual(session["role"], "viewer")
+        self.assertEqual(session["username"], "ali")
         self.assertEqual(app.session_role(session["token"]), "viewer")
-        self.assertNotIn("guvenli-test-123", app.get_setting("viewer_password_hash"))
+        self.assertEqual(app.assigned_accounts("ali"), ["FANDA", "YAVUZ"])
+        self.assertNotIn("guvenli-test-123", str(app.list_app_users()))
+
+    def test_user_update_invalidates_old_session_and_delete_removes_user(self):
+        app.save_app_user("mehmet", "ilk-sifre-123", ["A"])
+        session = app.create_session("mehmet", "ilk-sifre-123")
+        app.save_app_user("mehmet", "yeni-sifre-456", ["B"])
+        self.assertIsNone(app.session_role(session["token"]))
+        self.assertEqual(app.assigned_accounts("mehmet"), ["B"])
+        self.assertTrue(app.delete_app_user("mehmet")["deleted"])
+        with self.assertRaises(PermissionError):
+            app.create_session("mehmet", "yeni-sifre-456")
 
     def test_skip_request_is_claimed_once_for_account(self):
         app.save_skip_request("FANDA", "tur-1")
@@ -179,6 +192,12 @@ class VssBotTests(unittest.TestCase):
         })
         states = app.account_status_state()["accounts"]
         self.assertEqual([item["status"] for item in states], ["skipped", "running", "pending"])
+
+        filtered = app.account_status_state(["B", "ÖZEL"])
+        self.assertEqual([item["name"] for item in filtered["accounts"]], ["B", "ÖZEL"])
+        self.assertEqual([item["status"] for item in filtered["accounts"]], ["running", "not_scheduled"])
+        self.assertEqual(filtered["bot"]["progress"]["account_names"], ["B"])
+        self.assertEqual(app.account_catalog(), ["A", "B", "C"])
 
     def test_earnings_daily_and_all_time_reports(self):
         today = datetime.now().strftime("%Y-%m-%d")
