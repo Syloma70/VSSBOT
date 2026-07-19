@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -140,6 +141,30 @@ class VssBotTests(unittest.TestCase):
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             app.save_mode("danger")
+
+    def test_bot_control_and_heartbeat_are_in_dashboard(self):
+        app.save_bot_control(True)
+        app.save_agent_status({
+            "health": "running", "task_state": "Running",
+            "next_run": "2026-07-19 18:00:00", "last_result": 0,
+        })
+        status = app.dashboard_state()["bot"]
+        self.assertTrue(status["enabled"])
+        self.assertEqual(status["health"], "running")
+        self.assertEqual(status["next_run"], "2026-07-19 18:00:00")
+        self.assertEqual(app.save_bot_control(False)["health"], "off")
+
+    def test_earnings_daily_and_all_time_reports(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        entries = [
+            {"external_id": "e1", "occurred_at": today + " 01:00:00", "account": "A", "operation": "Uzay Farmı", "result": "10 taş"},
+            {"external_id": "e2", "occurred_at": "2020-01-01 01:00:00", "account": "B", "operation": "Mermi fabrikası", "result": "100 mermi"},
+        ]
+        self.assertEqual(app.save_earnings(entries), 2)
+        self.assertEqual(app.save_earnings(entries), 0)
+        reports = app.earnings_dashboard()
+        self.assertEqual(reports["daily"]["total"], 1)
+        self.assertEqual(reports["all_time"]["total"], 2)
 
     def test_schedule_accepts_minute_and_dot_formats(self):
         enabled, times = app.parse_schedule_command("/saat 04.16 08:05 14")

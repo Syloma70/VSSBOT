@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
@@ -98,6 +98,12 @@ def prepare_database() -> None:
             "INSERT OR IGNORE INTO settings(key, value) VALUES('event_enabled', '0')"
         )
         db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('bot_enabled', '1')"
+        )
+        db.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES('agent_status', '{}')"
+        )
+        db.execute(
             """
             CREATE TABLE IF NOT EXISTS event_rewards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,6 +118,20 @@ def prepare_database() -> None:
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_event_rewards_date ON event_rewards(occurred_at)"
         )
+        db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS earnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT NOT NULL UNIQUE,
+                occurred_at TEXT NOT NULL,
+                account TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                result TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            )
+            """
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_earnings_date ON earnings(occurred_at)")
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -336,7 +356,9 @@ def dashboard_state() -> dict:
     return {
         "mode": mode,
         "active": mode != "off",
+        "bot": bot_status_state(),
         "schedule": schedule_state(),
+        "earnings": earnings_dashboard(),
         "event": {
             **event_control_state(),
             "reward_count": event_count,
@@ -344,6 +366,118 @@ def dashboard_state() -> dict:
             "last_reward": dict(last_event) if last_event else None,
         },
         "server_time": utc_now(),
+    }
+
+
+def bot_status_state() -> dict:
+    enabled = get_setting("bot_enabled", "1") == "1"
+    try:
+        agent = json.loads(get_setting("agent_status", "{}"))
+        if not isinstance(agent, dict):
+            agent = {}
+    except (ValueError, TypeError, json.JSONDecodeError):
+        agent = {}
+    received_at = str(agent.get("received_at") or "")
+    age_seconds = None
+    if received_at:
+        try:
+            received = datetime.fromisoformat(received_at.replace("Z", "+00:00"))
+            age_seconds = max(0, int((datetime.now(timezone.utc) - received).total_seconds()))
+        except ValueError:
+            pass
+    if not enabled:
+        health = "off"
+    elif age_seconds is None or age_seconds > 45:
+        health = "offline"
+    else:
+        health = str(agent.get("health") or "idle")
+    return {
+        "enabled": enabled,
+        "health": health,
+        "heartbeat_age_seconds": age_seconds,
+        "task_state": str(agent.get("task_state") or "unknown"),
+        "last_run": agent.get("last_run"),
+        "last_result": agent.get("last_result"),
+        "next_run": agent.get("next_run"),
+        "message": str(agent.get("message") or ""),
+    }
+
+
+def save_bot_control(enabled: bool) -> dict:
+    set_setting("bot_enabled", "1" if enabled else "0")
+    return bot_status_state()
+
+
+def save_agent_status(payload: dict) -> dict:
+    allowed = {
+        "health", "task_state", "last_run", "last_result", "next_run", "message"
+    }
+    clean = {key: payload.get(key) for key in allowed if key in payload}
+    clean["received_at"] = utc_now()
+    set_setting("agent_status", json.dumps(clean, ensure_ascii=True, separators=(",", ":")))
+    return bot_status_state()
+
+
+def save_earnings(entries: list[dict]) -> int:
+    saved = 0
+    with database() as db:
+        for entry in entries[:1000]:
+            external_id = str(entry.get("external_id") or "").strip()
+            occurred_at = str(entry.get("occurred_at") or "").strip()
+            account = str(entry.get("account") or "").strip()
+            operation = str(entry.get("operation") or "").strip()
+            result = str(entry.get("result") or "").strip()
+            if not all((external_id, occurred_at, account, operation, result)):
+                continue
+            cursor = db.execute(
+                """INSERT OR IGNORE INTO earnings
+                   (external_id, occurred_at, account, operation, result, received_at)
+                   VALUES(?, ?, ?, ?, ?, ?)""",
+                (
+                    external_id[:200], occurred_at[:40], account[:200],
+                    operation[:200], result[:2000], utc_now(),
+                ),
+            )
+            saved += int(cursor.rowcount > 0)
+    return saved
+
+
+def earnings_summary(today_only: bool) -> dict:
+    where = ""
+    params: tuple = ()
+    if today_only:
+        today = datetime.now(timezone(timedelta(hours=3))).date().isoformat()
+        where = " WHERE substr(occurred_at, 1, 10)=?"
+        params = (today,)
+    with database() as db:
+        total = int(db.execute("SELECT COUNT(*) FROM earnings" + where, params).fetchone()[0])
+        accounts = int(db.execute(
+            "SELECT COUNT(DISTINCT account) FROM earnings" + where, params
+        ).fetchone()[0])
+        operations = db.execute(
+            "SELECT operation, COUNT(*) count FROM earnings" + where
+            + " GROUP BY operation ORDER BY count DESC, operation LIMIT 12",
+            params,
+        ).fetchall()
+    return {
+        "total": total,
+        "accounts": accounts,
+        "operations": [
+            {"operation": str(row["operation"]), "count": int(row["count"])}
+            for row in operations
+        ],
+    }
+
+
+def earnings_dashboard() -> dict:
+    with database() as db:
+        recent = db.execute(
+            "SELECT occurred_at, account, operation, result FROM earnings ORDER BY id DESC LIMIT 8"
+        ).fetchall()
+    return {
+        "daily": earnings_summary(True),
+        "all_time": earnings_summary(False),
+        "recent": [dict(row) for row in recent],
     }
 
 
@@ -594,6 +728,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(200, {"ok": True, **event_control_state()})
             return
+        if self.path == "/api/bot-control":
+            if not self.authorized_request():
+                self.send_json(401, {"ok": False, "error": "unauthorized"})
+                return
+            self.send_json(200, {"ok": True, **bot_status_state()})
+            return
         if self.path == "/api/schedule":
             if not self.authorized_request():
                 self.send_json(401, {"ok": False, "error": "unauthorized"})
@@ -606,6 +746,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if self.path not in {
             "/api/claim", "/api/events", "/api/schedule", "/api/mode",
             "/api/event-control",
+            "/api/bot-control", "/api/agent-status", "/api/earnings",
         }:
             self.send_json(404, {"ok": False, "error": "not_found"})
             return
@@ -625,6 +766,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 if not isinstance(payload.get("enabled"), bool):
                     raise ValueError("enabled must be boolean")
                 self.send_json(200, {"ok": True, **save_event_control(payload["enabled"])})
+                return
+            if self.path == "/api/bot-control":
+                if not isinstance(payload.get("enabled"), bool):
+                    raise ValueError("enabled must be boolean")
+                self.send_json(200, {"ok": True, **save_bot_control(payload["enabled"])})
+                return
+            if self.path == "/api/agent-status":
+                if not isinstance(payload, dict):
+                    raise ValueError("status must be an object")
+                self.send_json(200, {"ok": True, **save_agent_status(payload)})
+                return
+            if self.path == "/api/earnings":
+                entries = payload.get("entries") or []
+                if not isinstance(entries, list):
+                    raise ValueError("entries must be a list")
+                saved = save_earnings(entries)
+                self.send_json(200, {"ok": True, "received": len(entries), "saved": saved})
                 return
             if self.path == "/api/schedule":
                 enabled = bool(payload.get("enabled", True))
