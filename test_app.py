@@ -147,11 +147,13 @@ class VssBotTests(unittest.TestCase):
         app.save_agent_status({
             "health": "running", "task_state": "Running",
             "next_run": "2026-07-19 18:00:00", "last_result": 0,
+            "progress": {"phase": "normal", "current_account": "FANDA", "account_index": 4, "total_accounts": 13},
         })
         status = app.dashboard_state()["bot"]
         self.assertTrue(status["enabled"])
         self.assertEqual(status["health"], "running")
         self.assertEqual(status["next_run"], "2026-07-19 18:00:00")
+        self.assertEqual(status["progress"]["current_account"], "FANDA")
         self.assertEqual(app.save_bot_control(False)["health"], "off")
 
     def test_earnings_daily_and_all_time_reports(self):

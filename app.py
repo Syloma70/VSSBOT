@@ -393,6 +393,7 @@ def bot_status_state() -> dict:
         health = "offline"
     else:
         health = str(agent.get("health") or "idle")
+    progress = agent.get("progress") if isinstance(agent.get("progress"), dict) else {}
     return {
         "enabled": enabled,
         "health": health,
@@ -402,6 +403,7 @@ def bot_status_state() -> dict:
         "last_result": agent.get("last_result"),
         "next_run": agent.get("next_run"),
         "message": str(agent.get("message") or ""),
+        "progress": progress,
     }
 
 
@@ -412,7 +414,8 @@ def save_bot_control(enabled: bool) -> dict:
 
 def save_agent_status(payload: dict) -> dict:
     allowed = {
-        "health", "task_state", "last_run", "last_result", "next_run", "message"
+        "health", "task_state", "last_run", "last_result", "next_run", "message",
+        "progress",
     }
     clean = {key: payload.get(key) for key in allowed if key in payload}
     clean["received_at"] = utc_now()
