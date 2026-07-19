@@ -81,6 +81,19 @@ def prepare_database() -> None:
         db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('schedule_hours', '')"
         )
+        if not db.execute(
+            "SELECT 1 FROM settings WHERE key='schedule_times'"
+        ).fetchone():
+            old_hours = str(db.execute(
+                "SELECT value FROM settings WHERE key='schedule_hours'"
+            ).fetchone()[0])
+            migrated = ",".join(
+                f"{int(value):02d}:00" for value in old_hours.split(",") if value != ""
+            )
+            db.execute(
+                "INSERT INTO settings(key, value) VALUES('schedule_times', ?)",
+                (migrated,),
+            )
         db.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES('event_enabled', '0')"
         )
@@ -146,7 +159,7 @@ HELP_TEXT = (
     "📊 <b>Durumu öğren</b>\n"
     "<code>/durum</code> — Kayıtlı çalışma tercihini gösterir.\n\n"
     "🕐 <b>Otomatik tur saatleri (yalnız yönetici)</b>\n"
-    "<code>/saat 02 08 14 20</code> — Yalnız seçilen saatlerde çalıştırır.\n"
+    "<code>/saat 04.16 08:30 14</code> — Seçilen saat ve dakikalarda çalıştırır.\n"
     "<code>/saat her</code> — Her saat çalıştırır.\n"
     "<code>/saat kapat</code> — Otomatik turları kapatır.\n"
     "<code>/saatler</code> — Geçerli saat planını gösterir.\n\n"
@@ -275,23 +288,29 @@ def mode_text(mode: str) -> str:
 
 def schedule_state() -> dict:
     enabled = get_setting("schedule_enabled", "1") == "1"
-    raw_hours = get_setting("schedule_hours", "")
-    try:
-        hours = sorted({int(value) for value in raw_hours.split(",") if value != ""})
-    except ValueError:
-        hours = []
-    hours = [hour for hour in hours if 0 <= hour <= 23]
-    return {"enabled": enabled, "hours": hours, "timezone": "Europe/Istanbul"}
+    raw_times = get_setting("schedule_times", "")
+    times = []
+    for value in raw_times.split(","):
+        try:
+            hour_text, minute_text = value.split(":", 1)
+            hour, minute = int(hour_text), int(minute_text)
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                times.append(f"{hour:02d}:{minute:02d}")
+        except (ValueError, TypeError):
+            continue
+    times = sorted(set(times))
+    hours = [int(value[:2]) for value in times if value.endswith(":00")]
+    return {"enabled": enabled, "times": times, "hours": hours, "timezone": "Europe/Istanbul"}
 
 
 def schedule_text() -> str:
     state = schedule_state()
     if not state["enabled"]:
         plan = "KAPALI"
-    elif not state["hours"]:
+    elif not state["times"]:
         plan = "Her saat başı"
     else:
-        plan = ", ".join(f"{hour:02d}:00" for hour in state["hours"])
+        plan = ", ".join(state["times"])
     return f"🕐 <b>Otomatik tur planı</b>\n\n{plan}\nSaat dilimi: Türkiye"
 
 
@@ -335,7 +354,21 @@ def save_mode(mode: str) -> dict:
     return {"mode": mode, "active": mode != "off"}
 
 
-def parse_schedule_command(command_text: str) -> tuple[bool, list[int]]:
+def normalize_schedule_time(value: str) -> str:
+    value = value.strip().replace(".", ":")
+    if not value:
+        raise ValueError("Boş saat yazılamaz.")
+    parts = value.split(":", 1)
+    if not parts[0].isdigit() or (len(parts) > 1 and not parts[1].isdigit()):
+        raise ValueError(f"Geçersiz saat: {value}")
+    hour = int(parts[0])
+    minute = int(parts[1]) if len(parts) > 1 else 0
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
+        raise ValueError(f"Geçersiz saat: {value}. Saat 00:00 ile 23:59 arasında olmalı.")
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_schedule_command(command_text: str) -> tuple[bool, list[str]]:
     args = command_text.strip().split()[1:]
     if not args:
         raise ValueError("Kullanım: /saat 02 08 14 20, /saat her veya /saat kapat")
@@ -345,22 +378,24 @@ def parse_schedule_command(command_text: str) -> tuple[bool, list[int]]:
     if normalized in {"her", "hepsi", "saatlik", "ac", "aç", "on"}:
         return True, []
     values = [part for part in normalized.replace(",", " ").split() if part]
-    hours: set[int] = set()
+    times: set[str] = set()
     for value in values:
-        hour_text = value.split(":", 1)[0]
-        if not hour_text.isdigit() or not 0 <= int(hour_text) <= 23:
-            raise ValueError(f"Geçersiz saat: {value}. Saatler 0 ile 23 arasında olmalı.")
-        hours.add(int(hour_text))
-    if not hours:
+        times.add(normalize_schedule_time(value))
+    if not times:
         raise ValueError("En az bir saat yazmalısın.")
-    return True, sorted(hours)
+    return True, sorted(times)
 
 
-def save_schedule(enabled: bool, hours: list[int]) -> dict:
-    clean_hours = sorted({int(hour) for hour in hours if 0 <= int(hour) <= 23})
+def save_schedule(enabled: bool, times: list[str | int]) -> dict:
+    clean_times = sorted({normalize_schedule_time(str(value)) for value in times})
     with database() as db:
         set_setting("schedule_enabled", "1" if enabled else "0", db)
-        set_setting("schedule_hours", ",".join(map(str, clean_hours)), db)
+        set_setting("schedule_times", ",".join(clean_times), db)
+        set_setting(
+            "schedule_hours",
+            ",".join(value[:2].lstrip("0") or "0" for value in clean_times if value.endswith(":00")),
+            db,
+        )
     return schedule_state()
 
 
@@ -405,8 +440,8 @@ def apply_command(message: dict) -> None:
             response = "⛔ Otomatik tur saatlerini yalnız yönetici değiştirebilir."
         else:
             try:
-                enabled, hours = parse_schedule_command(command_text)
-                save_schedule(enabled, hours)
+                enabled, times = parse_schedule_command(command_text)
+                save_schedule(enabled, times)
                 response = "✅ Saat planı kaydedildi.\n\n" + schedule_text()
             except ValueError as error:
                 response = f"❌ {error}"
@@ -593,13 +628,19 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return
             if self.path == "/api/schedule":
                 enabled = bool(payload.get("enabled", True))
-                hours = payload.get("hours", [])
-                if not isinstance(hours, list) or any(
-                    isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23
-                    for hour in hours
-                ):
-                    raise ValueError("hours must be a list of integers from 0 to 23")
-                self.send_json(200, {"ok": True, **save_schedule(enabled, hours)})
+                if "times" in payload:
+                    times = payload.get("times")
+                    if not isinstance(times, list) or any(not isinstance(value, str) for value in times):
+                        raise ValueError("times must be a list of HH:MM strings")
+                else:
+                    hours = payload.get("hours", [])
+                    if not isinstance(hours, list) or any(
+                        isinstance(hour, bool) or not isinstance(hour, int) or not 0 <= hour <= 23
+                        for hour in hours
+                    ):
+                        raise ValueError("hours must be a list of integers from 0 to 23")
+                    times = [f"{hour:02d}:00" for hour in hours]
+                self.send_json(200, {"ok": True, **save_schedule(enabled, times)})
                 return
             events = payload.get("events") or []
             if not isinstance(events, list):

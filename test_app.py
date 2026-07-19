@@ -79,7 +79,7 @@ class VssBotTests(unittest.TestCase):
         message["from"]["id"] = 456
         with patch.object(app, "send_message") as send:
             app.apply_command(message)
-        self.assertEqual(app.schedule_state()["hours"], [2, 8, 14, 20])
+        self.assertEqual(app.schedule_state()["times"], ["02:00", "08:00", "14:00", "20:00"])
         self.assertTrue(app.schedule_state()["enabled"])
         self.assertIn("02:00", send.call_args.args[1])
 
@@ -123,7 +123,7 @@ class VssBotTests(unittest.TestCase):
 
     def test_dashboard_combines_control_states_and_event_totals(self):
         app.save_mode("always")
-        app.save_schedule(True, [2, 8])
+        app.save_schedule(True, ["02:00", "08:16"])
         app.save_event_control(True)
         app.save_events([{
             "external_id": "dashboard-event",
@@ -133,13 +133,20 @@ class VssBotTests(unittest.TestCase):
         }])
         dashboard = app.dashboard_state()
         self.assertEqual(dashboard["mode"], "always")
-        self.assertEqual(dashboard["schedule"]["hours"], [2, 8])
+        self.assertEqual(dashboard["schedule"]["times"], ["02:00", "08:16"])
         self.assertTrue(dashboard["event"]["enabled"])
         self.assertEqual(dashboard["event"]["reward_count"], 1)
 
     def test_invalid_mode_is_rejected(self):
         with self.assertRaises(ValueError):
             app.save_mode("danger")
+
+    def test_schedule_accepts_minute_and_dot_formats(self):
+        enabled, times = app.parse_schedule_command("/saat 04.16 08:05 14")
+        self.assertTrue(enabled)
+        self.assertEqual(times, ["04:16", "08:05", "14:00"])
+        app.save_schedule(enabled, times)
+        self.assertEqual(app.schedule_state()["times"], times)
 
     def test_long_messages_are_split(self):
         parts = app.split_text(("x" * 2000 + "\n") * 3)

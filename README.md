@@ -9,7 +9,7 @@ Volkan Arslan hesabının Ticarion PC otomasyonuna katılım kararını Telegram
 - `/surekli`: Her PC otomasyon turuna katıl.
 - `/iptal`: Tek seferlik ve sürekli bütün çalışma izinlerini kapat.
 - `/durum`: Mevcut tercihi göster.
-- `/saat 02 08 14 20`: Global otomatik turu yalnız seçilen Türkiye saatlerinde çalıştır.
+- `/saat 04.16 08:30 14`: Global otomatik turu seçilen Türkiye saat ve dakikalarında çalıştır.
 - `/saat her`: Global otomatik turu her saat başına döndür.
 - `/saat kapat`: Global otomatik turları durdur.
 - `/saatler`: Geçerli global saat planını göster.
@@ -60,7 +60,7 @@ PC otomasyonu etkinlik sonuçlarını aynı kimlik doğrulamasıyla `POST /api/e
 adresine gönderir. Kayıtlar `external_id` ile tekilleştirilir.
 
 Saat planı `GET /api/schedule` ile okunur ve `POST /api/schedule` ile güncellenir. POST
-gövdesi örneği: `{"enabled":true,"hours":[2,8,14,20]}`. Boş `hours` listesi her saat
+gövdesi örneği: `{"enabled":true,"times":["04:16","08:30"]}`. Boş `times` listesi her saat
 anlamına gelir.
 
 Android kontrol paneli `GET /api/dashboard`, `POST /api/mode` ve
